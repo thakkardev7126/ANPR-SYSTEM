@@ -1,0 +1,721 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ANPR trajectory dashboard</title>
+<link rel="stylesheet" href="hotlist.css">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root { --accent:#1F4E79; --bg:#0b0d12; --card:#141821; --border:#232837; --text:#eef1f5; --muted:#8b93a0; --ok:#2fae66; --warn:#d9a441; --bad:#d9534f; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,Segoe UI,Roboto,sans-serif; }
+  header { padding:20px 28px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px;}
+  header h1 { font-size:18px; margin:0; }
+  header .sub { color:var(--muted); font-size:12px; }
+  .stats { display:flex; gap:14px; }
+  .stat { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:10px 16px; text-align:center; min-width:90px; }
+  .stat .n { font-size:20px; font-weight:700; }
+  .stat .l { font-size:11px; color:var(--muted); }
+  .header-actions { display:flex; align-items:center; gap:14px; }
+  .clear-button { padding:10px 12px; background:transparent; color:var(--bad); border:1px solid rgba(217,83,79,0.5); border-radius:7px; cursor:pointer; font:inherit; font-size:12px; }
+  .clear-button:hover { background:rgba(217,83,79,0.12); }
+  main { display:grid; grid-template-columns: 320px 1fr; gap:0; min-height:calc(100vh - 78px); }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; } }
+  .panel { padding:20px; }
+  .panel h2 { font-size:13px; color:var(--muted); text-transform:uppercase; letter-spacing:0.06em; margin:0 0 14px; }
+  .vehicle-list { border-right:1px solid var(--border); }
+  .vehicle-item { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:12px 14px; margin-bottom:10px; cursor:pointer; transition:border-color .15s; }
+  .vehicle-item:hover, .vehicle-item.active { border-color:var(--accent); }
+  .vehicle-item .plate, .search-hit .plate { font-size:16px; font-weight:700; letter-spacing:0.5px; }
+  .vehicle-item .meta, .search-hit .meta { font-size:11px; color:var(--muted); margin-top:4px; }
+  .map-wrap { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:0; margin-bottom:20px; overflow:hidden; }
+  #leafletMap { width:100%; height:360px; background:#050608; }
+  .hop-list { display:flex; flex-direction:column; gap:8px; }
+  .hop { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:12px 14px; display:flex; justify-content:space-between; align-items:center; }
+  .hop.implausible { border-color:var(--bad); }
+  .hop .cam { font-weight:600; font-size:14px; }
+  .hop .time { font-size:12px; color:var(--muted); }
+  .badge { font-size:11px; padding:2px 8px; border-radius:20px; }
+  .badge.ok { background:rgba(47,174,102,0.15); color:var(--ok); }
+  .badge.warn { background:rgba(217,164,65,0.15); color:var(--warn); }
+  .badge.bad { background:rgba(217,83,79,0.15); color:var(--bad); }
+  .empty { color:var(--muted); font-size:13px; padding:20px; text-align:center; }
+  .live-wrap { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:16px; margin-bottom:20px; }
+  .live-toolbar { display:flex; gap:10px; align-items:center; margin-bottom:12px; }
+  .live-toolbar select { flex:1; padding:9px; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:7px; }
+  .stream-stage { position:relative; background:#050608; min-height:220px; overflow:hidden; }
+  .stream-stage img, .stream-stage canvas { width:100%; display:block; }
+  .stream-stage img { display:none; }
+  .stream-stage canvas { position:absolute; inset:0; height:100%; }
+  .stream-empty { min-height:220px; display:grid; place-items:center; color:var(--muted); font-size:13px; text-align:center; padding:24px; }
+  .review-list { display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:10px; margin-bottom:20px; }
+  .review-item { background:var(--card); border:1px solid rgba(217,164,65,0.45); border-radius:10px; padding:10px; display:grid; grid-template-columns:120px 1fr; gap:10px; }
+  .review-item img { width:120px; height:112px; object-fit:cover; border-radius:7px; background:#050608; }
+  .review-body { min-width:0; }
+  .review-row { display:flex; gap:8px; margin-top:8px; }
+  .review-row input { flex:1; min-width:0; padding:8px; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:7px; text-transform:uppercase; }
+  .review-row button { padding:8px 10px; background:var(--warn); color:#141821; border:0; border-radius:7px; font-weight:700; cursor:pointer; }
+  .search-wrap { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:12px; margin-bottom:20px; }
+  .search-row { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:8px; }
+  .search-row label { display:grid; gap:4px; font-size:12px; }
+  .search-row select { min-width:0; }
+  .header-actions { flex-wrap:wrap; }
+  header { gap:12px; }
+  .stats { flex-wrap:wrap; }
+  .plate, .meta, .cam { overflow-wrap:anywhere; }
+  .search-row input { min-width:0; padding:9px; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:7px; text-transform:uppercase; }
+  .search-row button { padding:9px 12px; background:var(--accent); color:var(--text); border:0; border-radius:7px; font-weight:700; cursor:pointer; }
+  .search-results { display:flex; flex-direction:column; gap:8px; margin-top:10px; }
+  .search-hit { border:1px solid var(--border); border-radius:8px; padding:10px; display:flex; justify-content:space-between; gap:12px; }
+  @media (max-width: 720px) { .search-row { grid-template-columns:1fr 1fr; } }
+  @media (max-width: 520px) { .review-item { grid-template-columns:1fr; } .review-item img { width:100%; } }
+  @media (max-width: 520px) { .search-row:has(input[type=datetime-local]) { grid-template-columns:1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>City-wide ANPR trajectory dashboard</h1>
+    <div class="sub">Live feed from phone-based demo cameras</div>
+  </div>
+  <div class="header-actions">
+    <a class="hotlist-link" href="hotlist.html">Hotlist &amp; alerts</a>
+    <div class="stats">
+      <div class="stat"><div class="n" id="statScans">0</div><div class="l">scans</div></div>
+      <div class="stat"><div class="n" id="statVehicles">0</div><div class="l">vehicles</div></div>
+      <div class="stat"><div class="n" id="statReview">0</div><div class="l">needs review</div></div>
+    </div>
+    <button class="clear-button" id="clearHistory" type="button">Clear scan history</button>
+  </div>
+</header>
+
+<main>
+  <div class="panel vehicle-list">
+    <h2>Vehicles seen</h2>
+    <div id="vehicleList"><div class="empty">Waiting for the first scan…</div></div>
+  </div>
+
+  <div class="panel">
+    <h2>Live camera node</h2>
+    <div class="live-wrap">
+      <div class="live-toolbar">
+        <select id="cameraSelect" aria-label="Active camera node"></select>
+        <span id="streamStatus" class="badge warn">offline</span>
+      </div>
+      <form id="locationForm" class="search-row" style="margin-bottom:12px">
+        <label>Latitude <input id="cameraLat" type="number" step="any" min="-90" max="90"></label>
+        <label>Longitude <input id="cameraLng" type="number" step="any" min="-180" max="180"></label>
+        <button type="submit">Save location</button>
+        <span id="locationStatus" role="status"></span>
+      </form>
+      <div class="stream-stage">
+        <img id="liveFrame" alt="Live camera frame">
+        <canvas id="overlay"></canvas>
+        <div id="streamEmpty" class="stream-empty">Select a connected camera node to view its live feed.</div>
+      </div>
+    </div>
+    <h2>Camera road network</h2>
+    <div id="roadNetworkList" class="hop-list" style="margin-bottom:20px">
+      <div class="empty">No configured camera road connections.</div>
+    </div>
+    <h2>Review queue</h2>
+    <div id="reviewList" class="review-list">
+      <div class="empty">No low-confidence scans waiting.</div>
+    </div>
+    <h2>Match review</h2>
+    <div id="matchReviewList" class="review-list">
+      <div class="empty">No vehicle match candidates waiting.</div>
+    </div>
+    <h2>Fuzzy GIS search</h2>
+    <div class="search-wrap">
+      <div class="search-row">
+        <input id="searchPlate" maxlength="12" placeholder="GJ01HV8768" aria-label="Plate search">
+        <input id="searchRadius" type="number" min="1" value="5000" aria-label="Radius in metres">
+        <input id="searchMinutes" type="number" min="1" value="30" aria-label="Time window in minutes">
+        <button id="searchBtn" type="button">Search</button>
+      </div>
+      <div class="search-row" style="margin-top:8px">
+        <label>Start <input id="searchStart" type="datetime-local"></label>
+        <label>End <input id="searchEnd" type="datetime-local"></label>
+        <button id="resetSearch" type="button">Reset filters</button>
+      </div>
+      <div id="searchResults" class="search-results">
+        <div class="empty">Search partial or misread plates near the selected camera.</div>
+      </div>
+    </div>
+    <h2>Trajectory</h2>
+    <div class="map-wrap">
+      <div id="leafletMap"></div>
+    </div>
+    <div id="hopList" class="hop-list">
+      <div class="empty">Select a vehicle on the left to see its path.</div>
+    </div>
+  </div>
+</main>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="reconnecting-socket.js"></script>
+<script src="hotlist-alerts.js"></script>
+<script>
+const API_BASE = window.location.port === "5500"
+  ? `${window.location.protocol}//${window.location.hostname}:8000`
+  : `${window.location.protocol}//${window.location.host}`;
+const DEMO_CAMERAS = [
+  { camera_id: "CAM01", label: "College Main Gate", lat: 23.0395, lng: 72.5660 },
+  { camera_id: "CAM02", label: "SG Highway Junction", lat: 23.0325, lng: 72.5145 },
+  { camera_id: "CAM03", label: "CG Road Crossing", lat: 23.0258, lng: 72.5644 },
+  { camera_id: "CAM04", label: "Parking Exit", lat: 23.0410, lng: 72.5590 },
+];
+
+function isReviewStatus(status) {
+  return ["PENDING_REVIEW", "needs_review"].includes(status);
+}
+
+let cameras = [];
+let selectedPlate = null;
+let selectedVehicleId = null;
+let selectedCamera = null;
+let cameraSocket = null;
+let eventSocket = null;
+let snapshotTimer = null;
+let trajectoryFilters = null;
+let refreshing = false;
+let streamConnected = false;
+let leafletMap = null;
+let cameraLayer = null;
+let routeLayer = null;
+const liveFrame = document.getElementById("liveFrame");
+const overlay = document.getElementById("overlay");
+const streamEmpty = document.getElementById("streamEmpty");
+
+async function fetchJSON(path) {
+  const res = await fetchWithTimeout(`${API_BASE}${path}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+function fetchWithTimeout(url, options = {}, timeoutMs = 3500) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(new DOMException("Request timed out", "TimeoutError")), timeoutMs);
+  return fetch(url, { ...options, signal: controller.signal })
+    .finally(() => clearTimeout(timeout));
+}
+
+function connectEventSocket() {
+  if (eventSocket && !eventSocket.stopped) return;
+  const wsBase = API_BASE.replace(/^http/, "ws");
+  eventSocket = new ANPRSocket(`${wsBase}/ws/events`, {
+    onMessage: data => {
+      if (["event_created", "events_created", "event_corrected", "events_cleared", "match_reviewed"].includes(data.type)) refresh();
+    },
+  });
+}
+
+function waitForEventSocket(timeoutMs = 900) {
+  connectEventSocket();
+  if (eventSocket && eventSocket.readyState === WebSocket.OPEN) return Promise.resolve(true);
+  return new Promise(resolve => {
+    if (!eventSocket) return resolve(false);
+    const timeout = setTimeout(() => resolve(false), timeoutMs);
+    eventSocket.addEventListener("open", () => {
+      clearTimeout(timeout);
+      resolve(true);
+    }, { once: true });
+  });
+}
+
+function initLeafletMap() {
+  if (!window.L || leafletMap) return;
+  leafletMap = L.map("leafletMap", { zoomControl: true }).setView([23.034, 72.55], 12);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    attribution: "&copy; OpenStreetMap contributors",
+    maxZoom: 19,
+  }).addTo(leafletMap);
+  cameraLayer = L.layerGroup().addTo(leafletMap);
+  routeLayer = L.layerGroup().addTo(leafletMap);
+}
+
+function renderMap(hops) {
+  initLeafletMap();
+  if (!leafletMap || !cameraLayer || !routeLayer) return;
+  cameraLayer.clearLayers();
+  routeLayer.clearLayers();
+
+  const bounds = [];
+  cameras.forEach(camera => {
+    if (camera.lat == null || camera.lng == null) return;
+    const marker = L.circleMarker([camera.lat, camera.lng], {
+      radius: 6,
+      color: "#8b93a0",
+      fillColor: "#1F4E79",
+      fillOpacity: 0.85,
+      weight: 2,
+    }).bindPopup(`<strong>${camera.camera_id}</strong><br>${camera.label}`);
+    marker.addTo(cameraLayer);
+    bounds.push([camera.lat, camera.lng]);
+  });
+
+  const routePoints = (hops || [])
+    .filter(hop => hop.lat != null && hop.lng != null)
+    .map(hop => [hop.lat, hop.lng]);
+  if (routePoints.length) {
+    L.polyline(routePoints, {
+      color: "#37d67a",
+      weight: 4,
+      opacity: 0.9,
+    }).addTo(routeLayer);
+    hops.filter(hop => hop.lat != null && hop.lng != null).forEach((hop, index) => {
+      const popup = `<strong>${index + 1}. ${hop.camera_id}</strong><br>${hop.camera_label}<br>${new Date(hop.timestamp).toLocaleString()}<br>${hop.matched_plate_text || selectedPlate || ""}`;
+      L.marker([hop.lat, hop.lng]).bindPopup(popup).addTo(routeLayer);
+      bounds.push([hop.lat, hop.lng]);
+    });
+  }
+
+  if (bounds.length) leafletMap.fitBounds(bounds, { padding: [28, 28], maxZoom: 15 });
+}
+
+async function loadRoadNetwork() {
+  const data = await fetchJSON("/api/camera-road-network");
+  const list = document.getElementById("roadNetworkList");
+  if (!data.connections.length) {
+    list.innerHTML = `<div class="empty">No configured camera road connections.</div>`;
+    return;
+  }
+  list.innerHTML = data.connections.slice(0, 8).map(connection => `
+    <div class="hop">
+      <div>
+        <div class="cam">${connection.source_camera_id} → ${connection.destination_camera_id}</div>
+        <div class="time">${connection.distance_km} km · ${connection.direction || "Direction unavailable"} · ${connection.distance_source}</div>
+        ${connection.road_name ? `<div class="time">${connection.road_name}${connection.road_type ? ` · ${connection.road_type}` : ""}</div>` : ""}
+      </div>
+      <span class="badge ${connection.active ? "ok" : "warn"}">${connection.active ? "active" : "inactive"}</span>
+    </div>
+  `).join("");
+}
+
+function formatDuration(seconds) {
+  if (seconds == null) return "Not available";
+  const total = Math.round(Number(seconds));
+  const minutes = Math.floor(total / 60);
+  const remaining = total % 60;
+  return minutes ? `${minutes}m ${remaining}s` : `${remaining}s`;
+}
+
+function speedLine(item) {
+  if (!item || item.speed_status === "unavailable") return "";
+  if (item.speed_available) {
+    const distance = item.road_distance_meters ?? item.distance_meters;
+    const distanceText = distance != null ? `${(Number(distance) / 1000).toFixed(2)} km` : "Distance unavailable";
+    const approx = item.distance_is_approximate ? " approx." : "";
+    return `<div class="time">${distanceText}${approx} · ${formatDuration(item.travel_time_seconds)} · ${Number(item.estimated_speed_kmh).toFixed(1)} km/h estimated</div>`;
+  }
+  const reason = (item.speed_status || "unavailable").replaceAll("_", " ");
+  return `<div class="time">Speed: Not available · ${reason}</div>`;
+}
+
+function renderHops(hops) {
+  const list = document.getElementById("hopList");
+  if (!hops || !hops.length) {
+    list.innerHTML = `<div class="empty">No sightings yet.</div>`;
+    return;
+  }
+  list.innerHTML = hops.map((h, i) => {
+    let badge = `<span class="badge ok">confirmed</span>`;
+    if (isReviewStatus(h.status)) badge = `<span class="badge warn">low confidence</span>`;
+    if (i > 0 && !h.plausible) badge = `<span class="badge bad">too fast — check</span>`;
+    const elapsed = h.elapsed_minutes != null ? ` · +${h.elapsed_minutes} min` : "";
+    return `
+      <div class="hop ${i > 0 && !h.plausible ? "implausible" : ""}">
+        <div>
+          <div class="cam">${i + 1}. ${h.camera_label}</div>
+          <div class="time">${new Date(h.timestamp).toLocaleTimeString()}${elapsed}</div>
+          ${i > 0 ? speedLine(h) : ""}
+        </div>
+        ${badge}
+      </div>`;
+  }).join("");
+}
+
+function renderVehicleHistory(history, speedHistory = null) {
+  const list = document.getElementById("hopList");
+  const observations = history?.observations || [];
+  if (!observations.length) {
+    list.innerHTML = `<div class="empty">No observations found for this Global Vehicle ID.</div>`;
+    return;
+  }
+  const segmentsByEndEvent = new Map((speedHistory?.segments || []).map(segment => [segment.end_event_id, segment]));
+  list.innerHTML = observations.map((observation, index) => `
+    <div class="hop">
+      <div>
+        <div class="cam">${index + 1}. ${observation.camera_label || observation.camera_id}</div>
+        <div class="time">${new Date(observation.timestamp).toLocaleString()} · ${observation.plate_text || "No plate"}</div>
+        <div class="time">${observation.global_vehicle_id}</div>
+        <div class="time">${observation.vehicle_color || "Color unavailable"} · ${observation.vehicle_type || "Type unavailable"} · Appearance ${observation.appearance_available ? "available" : "unavailable"}</div>
+        ${index > 0 ? speedLine(segmentsByEndEvent.get(observation.event_id)) : ""}
+      </div>
+      <span class="badge ${isReviewStatus(observation.plate_status) ? "warn" : "ok"}">${observation.plate_status}</span>
+    </div>
+  `).join("");
+}
+
+function drawOverlay(result) {
+  const ctx = overlay.getContext("2d");
+  overlay.width = liveFrame.naturalWidth || 640;
+  overlay.height = liveFrame.naturalHeight || 360;
+  ctx.clearRect(0, 0, overlay.width, overlay.height);
+  (result?.detections || []).forEach(d => {
+    ctx.strokeStyle = "#37d67a";
+    ctx.lineWidth = 3;
+    ctx.strokeRect(d.x, d.y, d.width, d.height);
+    ctx.fillStyle = "#37d67a";
+    ctx.font = "bold 16px sans-serif";
+    ctx.fillText(d.plate_text || "plate", d.x, Math.max(18, d.y - 6));
+  });
+}
+
+function selectCamera(cameraId) {
+  selectedCamera = cameraId;
+  if (cameraSocket) cameraSocket.close();
+  streamConnected = false;
+  liveFrame.style.display = "none";
+  streamEmpty.style.display = "grid";
+  liveFrame.removeAttribute("src");
+  liveFrame.onload = () => {
+    liveFrame.style.display = streamConnected ? "block" : "none";
+    streamEmpty.style.display = streamConnected ? "none" : "grid";
+  };
+  liveFrame.onerror = () => {
+    liveFrame.style.display = "none";
+    streamEmpty.textContent = "This camera node is disconnected or has no stream URL.";
+    streamEmpty.style.display = "grid";
+  };
+  const wsBase = API_BASE.replace(/^http/, "ws");
+  clearInterval(snapshotTimer);
+  snapshotTimer = setInterval(() => {
+    if (!document.hidden && streamConnected && cameraSocket?.readyState === 1) {
+      liveFrame.src = `${API_BASE}/api/cameras/${encodeURIComponent(cameraId)}/snapshot?t=${Date.now()}`;
+    }
+  }, 1000);
+  cameraSocket = new ANPRSocket(`${wsBase}/ws/cameras/${encodeURIComponent(cameraId)}`, {
+    onState: state => {
+      document.getElementById("streamStatus").textContent = state;
+      document.getElementById("streamStatus").className = `badge ${state === "connected" ? "ok" : "warn"}`;
+    },
+    onMessage: data => {
+      streamConnected = data.status === "connected";
+      if (streamConnected) {
+        liveFrame.src = `${API_BASE}/api/cameras/${encodeURIComponent(cameraId)}/snapshot?t=${Date.now()}`;
+      } else {
+        liveFrame.style.display = "none";
+        streamEmpty.textContent = "Camera disconnected";
+        streamEmpty.style.display = "grid";
+      }
+      document.getElementById("streamStatus").textContent = data.status;
+      drawOverlay(data.result);
+    },
+  });
+  const camera = cameras.find(item => item.camera_id === cameraId);
+  document.getElementById("cameraLat").value = camera?.lat ?? "";
+  document.getElementById("cameraLng").value = camera?.lng ?? "";
+}
+
+function renderCameraSelector() {
+  const select = document.getElementById("cameraSelect");
+  select.innerHTML = cameras.map(c => `<option value="${c.camera_id}">${c.camera_id} — ${c.label}</option>`).join("");
+  if (!selectedCamera && cameras.length) selectedCamera = cameras[0].camera_id;
+  if (selectedCamera) {
+    select.value = selectedCamera;
+    if (!cameraSocket) selectCamera(selectedCamera);
+  }
+  select.onchange = () => selectCamera(select.value);
+}
+
+async function loadVehicles() {
+  const vehicles = await fetchJSON("/api/vehicles");
+  const list = document.getElementById("vehicleList");
+  if (!vehicles.length) {
+    list.innerHTML = `<div class="empty">Waiting for the first scan…</div>`;
+    return;
+  }
+  list.innerHTML = vehicles.map(v => `
+    <div class="vehicle-item ${v.plate_text === selectedPlate ? "active" : ""}" data-plate="${v.plate_text}" data-vehicle-id="${v.global_vehicle_id || v.vehicle_id || ""}">
+      <div class="plate">${v.plate_text}</div>
+      ${v.global_vehicle_id || v.vehicle_id ? `<div class="meta">${v.global_vehicle_id || v.vehicle_id}</div>` : ""}
+      <div class="meta">${v.sightings} sighting${v.sightings > 1 ? "s" : ""} · last at ${v.last_camera}</div>
+    </div>
+  `).join("");
+
+  document.querySelectorAll(".vehicle-item").forEach(el => {
+    el.addEventListener("click", () => selectVehicle(el.dataset.plate, el.dataset.vehicleId));
+  });
+
+  if (!selectedPlate && vehicles.length) selectVehicle(vehicles[0].plate_text, vehicles[0].global_vehicle_id || vehicles[0].vehicle_id);
+}
+
+function trajectoryUrl(plate) {
+  return `/api/trajectory/${encodeURIComponent(plate)}${trajectoryFilters ? `?${trajectoryFilters}` : ""}`;
+}
+
+async function selectVehicle(plate, vehicleId) {
+  selectedPlate = plate;
+  if (vehicleId !== undefined) selectedVehicleId = vehicleId || null;
+  document.querySelectorAll(".vehicle-item").forEach(el => {
+    el.classList.toggle("active", el.dataset.plate === plate);
+  });
+  try {
+    const data = await fetchJSON(trajectoryUrl(plate));
+    renderMap(data.hops);
+    if (selectedVehicleId) {
+      try {
+        const history = await fetchJSON(`/api/vehicles/${encodeURIComponent(selectedVehicleId)}/history`);
+        let speedHistory = null;
+        try { speedHistory = await fetchJSON(`/api/vehicles/${encodeURIComponent(selectedVehicleId)}/speed-history`); } catch (error) {}
+        renderVehicleHistory(history, speedHistory);
+      } catch (error) {
+        renderHops(data.hops);
+      }
+    } else {
+      renderHops(data.hops);
+    }
+  } catch (error) { renderMap([]); renderHops([]); }
+}
+
+async function loadStats() {
+  const s = await fetchJSON("/api/stats");
+  document.getElementById("statScans").textContent = s.total_scans;
+  document.getElementById("statVehicles").textContent = s.unique_vehicles;
+  document.getElementById("statReview").textContent = s.needs_review;
+}
+
+async function loadReviewQueue() {
+  const events = await fetchJSON("/api/events");
+  const pending = events.filter(event => isReviewStatus(event.status)).slice(0, 6);
+  const list = document.getElementById("reviewList");
+  if (!pending.length) {
+    list.innerHTML = `<div class="empty">No low-confidence scans waiting.</div>`;
+    return;
+  }
+  list.innerHTML = pending.map(event => `
+    <div class="review-item" data-event-id="${event.event_id}">
+      ${event.image_path ? `<img src="${API_BASE}${event.image_path}" alt="Plate scan requiring review">` : ""}
+      <div class="review-body">
+        <div class="plate">${event.plate_text || "Unreadable"}</div>
+        <div class="meta">${event.camera_id} · ${event.confidence != null ? Math.round(event.confidence * 100) : 0}% confidence${event.plate_category ? ` · ${event.plate_category}` : ""}${event.layout ? ` · ${event.layout}` : ""}</div>
+        <div class="meta">${event.vehicle_color || "Color unavailable"} · Appearance ${event.appearance_available ? "available" : "unavailable"}</div>
+        <div class="review-row">
+          <input value="${event.plate_text || ""}" maxlength="12" aria-label="Correct plate text">
+          <button type="button">Approve & Retrain</button>
+        </div>
+      </div>
+    </div>
+  `).join("");
+
+  list.querySelectorAll(".review-item").forEach(item => {
+    item.querySelector("button").addEventListener("click", async () => {
+      const value = item.querySelector("input").value.trim().toUpperCase();
+      if (!value) return;
+      const socketReady = await waitForEventSocket();
+      if (socketReady) {
+        eventSocket.send(JSON.stringify({
+          action: "correct_event",
+          event_id: Number(item.dataset.eventId),
+          corrected_text: value,
+        }));
+      } else {
+        const form = new FormData();
+        form.append("corrected_text", value);
+        const response = await fetch(`${API_BASE}/api/events/${item.dataset.eventId}/correct`, {
+          method: "POST",
+          body: form,
+        });
+        if (response.ok) await refresh();
+      }
+    });
+  });
+}
+
+async function loadMatchQueue() {
+  const data = await fetchJSON("/api/matches/review?limit=6");
+  const list = document.getElementById("matchReviewList");
+  if (!data.items.length) {
+    list.innerHTML = `<div class="empty">No vehicle match candidates waiting.</div>`;
+    return;
+  }
+  list.innerHTML = data.items.map(match => {
+    const a = match.observation_a || {};
+    const b = match.observation_b || {};
+    const pct = Math.round((match.final_confidence || 0) * 100);
+    const appearance = match.appearance_similarity != null ? `${Math.round(match.appearance_similarity * 100)}% appearance` : "No appearance";
+    const plate = match.plate_evidence?.used ? `${Math.round((match.plate_evidence.similarity || 0) * 100)}% plate` : "No valid plate evidence";
+    return `
+      <div class="review-item" data-match-id="${match.match_id}">
+        ${b.vehicle_crop_path || b.image_path ? `<img src="${API_BASE}${b.vehicle_crop_path || b.image_path}" alt="Candidate vehicle observation">` : ""}
+        <div class="review-body">
+          <div class="plate">${pct}% · ${match.state}</div>
+          <div class="meta">${a.camera_id || "CAM?"} → ${b.camera_id || "CAM?"} · ${plate} · ${appearance}</div>
+          <div class="meta">${a.plate_text || "Unreadable"} / ${b.plate_text || "Unreadable"} · ${b.vehicle_color || a.vehicle_color || "Color unavailable"}</div>
+          <div class="review-row">
+            <button type="button" data-action="accept">Accept match</button>
+            <button type="button" data-action="reject">Reject</button>
+          </div>
+        </div>
+      </div>
+    `;
+  }).join("");
+
+  list.querySelectorAll(".review-item button").forEach(button => {
+    button.addEventListener("click", async () => {
+      const item = button.closest(".review-item");
+      const response = await fetch(`${API_BASE}/api/matches/${item.dataset.matchId}/review`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: button.dataset.action }),
+      });
+      if (response.ok) await refresh();
+    });
+  });
+}
+
+async function searchSightings() {
+  const plate = document.getElementById("searchPlate").value.trim().toUpperCase();
+  const resultsBox = document.getElementById("searchResults");
+  if (!plate) return;
+
+  const anchorCamera = cameras.find(camera => camera.camera_id === selectedCamera);
+  if (anchorCamera?.lat == null || anchorCamera?.lng == null) {
+    resultsBox.textContent = "Set the selected camera's location before searching by radius.";
+    return;
+  }
+  const params = new URLSearchParams({
+    q: plate, radius_m: document.getElementById("searchRadius").value || "5000",
+    minutes: document.getElementById("searchMinutes").value || "30", similarity: "0.7",
+    lat: anchorCamera.lat, lng: anchorCamera.lng,
+  });
+  const start = document.getElementById("searchStart").value;
+  const end = document.getElementById("searchEnd").value;
+  if (start) params.set("start", new Date(start).toISOString());
+  if (end) params.set("end", new Date(end).toISOString());
+  if (start && end && new Date(start) > new Date(end)) {
+    resultsBox.textContent = "Start must be before end.";
+    return;
+  }
+  trajectoryFilters = new URLSearchParams(params);
+  trajectoryFilters.delete("q");
+  trajectoryFilters.delete("similarity");
+  resultsBox.innerHTML = `<div class="empty">Searching sightings...</div>`;
+  try {
+    const data = await fetchJSON(`/api/search/plates?${params.toString()}`);
+    if (!data.matches.length) {
+      renderMap([]);
+      renderHops([]);
+      resultsBox.innerHTML = `<div class="empty">No nearby fuzzy matches found.</div>`;
+      return;
+    }
+    resultsBox.innerHTML = data.matches.slice(0, 8).map(match => `
+      <div class="search-hit" data-plate="${match.plate_text}" data-vehicle-id="${match.global_vehicle_id || match.vehicle_id || ""}">
+        <div>
+          <div class="plate">${match.plate_text}</div>
+          <div class="meta">${match.camera_label || match.camera_id} · ${new Date(match.timestamp).toLocaleString()}</div>
+        </div>
+        <div class="meta" style="text-align:right;">
+          ${Math.round((match.match_score || 0) * 100)}% match<br>
+          ${match.distance_m != null ? `${Math.round(match.distance_m)} m` : data.engine}
+        </div>
+      </div>
+    `).join("");
+    document.querySelectorAll(".search-hit").forEach(hit => {
+      hit.addEventListener("click", () => selectVehicle(hit.dataset.plate, hit.dataset.vehicleId));
+    });
+    if (data.matches[0]?.plate_text) await selectVehicle(data.matches[0].plate_text, data.matches[0].global_vehicle_id || data.matches[0].vehicle_id);
+  } catch (error) {
+    resultsBox.innerHTML = `<div class="empty">Search failed. Check backend/database status.</div>`;
+  }
+}
+
+async function clearHistory() {
+  if (!confirm("Delete all scan history and uploaded scan images? Camera settings will be kept.")) return;
+  const response = await fetch(`${API_BASE}/api/events`, { method: "DELETE" });
+  if (!response.ok) {
+    alert("Could not clear scan history.");
+    return;
+  }
+  selectedPlate = null;
+  selectedVehicleId = null;
+  renderMap([]);
+  document.getElementById("hopList").innerHTML = `<div class="empty">Select a vehicle on the left to see its path.</div>`;
+  await refresh();
+}
+
+document.getElementById("clearHistory").addEventListener("click", clearHistory);
+document.getElementById("searchBtn").addEventListener("click", searchSightings);
+document.getElementById("searchPlate").addEventListener("keydown", event => {
+  if (event.key === "Enter") searchSightings();
+});
+
+async function refresh() {
+  if (refreshing) return;
+  refreshing = true;
+  try {
+  try {
+    const loadedCameras = await fetchJSON("/api/cameras");
+    cameras = loadedCameras.length ? loadedCameras : DEMO_CAMERAS;
+  } catch (error) {
+    cameras = DEMO_CAMERAS;
+    document.getElementById("streamStatus").textContent = "backend offline";
+    document.getElementById("streamStatus").className = "badge warn";
+  }
+  renderCameraSelector();
+  try { await loadStats(); } catch (error) {}
+  try { await loadRoadNetwork(); } catch (error) {}
+  try { await loadReviewQueue(); } catch (error) {}
+  try { await loadMatchQueue(); } catch (error) {}
+  try { await loadVehicles(); } catch (error) {}
+  if (selectedPlate) {
+    try {
+      const data = await fetchJSON(trajectoryUrl(selectedPlate));
+      renderMap(data.hops);
+      renderHops(data.hops);
+    } catch (error) { renderMap([]); renderHops([]); }
+  }
+  } finally { refreshing = false; }
+}
+
+document.getElementById("locationForm").addEventListener("submit", async event => {
+  event.preventDefault();
+  if (!selectedCamera) return;
+  const lat = document.getElementById("cameraLat").value;
+  const lng = document.getElementById("cameraLng").value;
+  const status = document.getElementById("locationStatus");
+  if ((lat === "") !== (lng === "")) { status.textContent = "Enter both coordinates."; return; }
+  try {
+    const response = await fetch(`${API_BASE}/api/cameras/${encodeURIComponent(selectedCamera)}`, {
+      method: "PATCH", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ lat: lat === "" ? null : Number(lat), lng: lng === "" ? null : Number(lng) }),
+    });
+    if (!response.ok) throw new Error("Location not saved");
+    status.textContent = lat === "" ? "Location unknown" : "Location saved";
+    await refresh();
+  } catch (error) { status.textContent = error.message; }
+});
+document.getElementById("searchStart").addEventListener("input", event => {
+  document.getElementById("searchMinutes").disabled = Boolean(event.target.value);
+});
+document.getElementById("resetSearch").addEventListener("click", () => {
+  trajectoryFilters = null;
+  document.getElementById("searchStart").value = "";
+  document.getElementById("searchEnd").value = "";
+  document.getElementById("searchMinutes").disabled = false;
+  document.getElementById("searchResults").textContent = "";
+  refresh();
+});
+window.addEventListener("pagehide", () => { eventSocket?.close(); cameraSocket?.close(); clearInterval(snapshotTimer); });
+window.addEventListener("pageshow", event => {
+  if (event.persisted) { connectEventSocket(); if (selectedCamera) selectCamera(selectedCamera); }
+});
+connectEventSocket();
+refresh();
+setInterval(refresh, 4000); // live polling — good enough for a demo
+</script>
+</body>
+</html>

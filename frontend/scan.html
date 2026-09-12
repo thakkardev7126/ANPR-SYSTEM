@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ANPR camera scan</title>
+<link rel="stylesheet" href="hotlist.css">
+<style>
+  :root { --accent:#1F4E79; --bg:#0f1115; --card:#171a21; --text:#eef1f5; --muted:#9aa3ad; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: -apple-system, Segoe UI, Roboto, sans-serif; background:var(--bg); color:var(--text); min-height:100vh; display:flex; flex-direction:column; align-items:center; padding:24px 16px; }
+  h1 { font-size:18px; font-weight:600; margin:0 0 4px; }
+  .sub { color:var(--muted); font-size:13px; margin-bottom:20px; text-align:center;}
+  .card { background:var(--card); border-radius:14px; padding:20px; width:100%; max-width:420px; }
+  label { display:block; font-size:13px; color:var(--muted); margin-bottom:6px; }
+  select, input[type=file] { width:100%; padding:10px; border-radius:8px; border:1px solid #2b2f38; background:#0f1115; color:var(--text); font-size:15px; margin-bottom:16px; }
+  .file-actions { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:16px; }
+  .file-button { display:block; padding:12px 8px; border-radius:8px; border:1px solid #2b2f38; background:#0f1115; color:var(--text); font-size:14px; text-align:center; cursor:pointer; }
+  .file-button input { display:none; }
+  .capture-btn { display:block; width:100%; padding:16px; border-radius:10px; border:none; background:var(--accent); color:white; font-size:16px; font-weight:600; text-align:center; cursor:pointer; }
+  .capture-btn:disabled { opacity:0.5; }
+  .preview { width:100%; border-radius:10px; margin-top:16px; display:none; }
+  .result { margin-top:18px; padding:14px; border-radius:10px; display:none; }
+  .result.ok { background:#123c2a; border:1px solid #1f6e46; }
+  .result.review { background:#3c2f12; border:1px solid #7a5a12; }
+  .result.fail { background:#3c1212; border:1px solid #7a1212; }
+  .correction { margin-top:12px; display:none; }
+  .correction input { width:100%; padding:10px; border-radius:8px; border:1px solid #7a5a12; background:#0f1115; color:var(--text); font-size:16px; text-transform:uppercase; }
+  .correction button { width:100%; margin-top:8px; padding:10px; border:0; border-radius:8px; background:#c58b20; color:#171a21; font-weight:700; }
+  .plate { font-size:26px; font-weight:700; letter-spacing:1px; margin:4px 0; }
+  .meta { font-size:12px; color:var(--muted); }
+  .log { margin-top:20px; width:100%; max-width:420px; }
+  .log-item { font-size:12px; color:var(--muted); padding:6px 0; border-bottom:1px solid #22262f; display:flex; justify-content:space-between; }
+  .live { position:relative; background:#050608; min-height:220px; margin-bottom:16px; overflow:hidden; }
+  .live img, .live canvas { width:100%; display:block; }
+  .live img { display:none; }
+  .live canvas { position:absolute; inset:0; height:100%; }
+  .live-empty { min-height:220px; display:grid; place-items:center; color:var(--muted); font-size:13px; text-align:center; padding:24px; }
+  .auto-camera { margin:16px 0; padding-top:16px; border-top:1px solid #2b2f38; }
+  .auto-stage { background:#050608; border-radius:10px; min-height:220px; overflow:hidden; display:grid; place-items:center; margin-bottom:12px; }
+  .auto-stage video { width:100%; display:none; }
+  .auto-actions { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:10px; }
+  .auto-actions button { padding:11px 8px; border-radius:8px; border:1px solid #2b2f38; background:#0f1115; color:var(--text); font-size:14px; cursor:pointer; }
+  .auto-actions button:disabled { opacity:0.45; cursor:not-allowed; }
+</style>
+</head>
+<body data-hotlist-scope="camera">
+  <h1>ANPR field scanner</h1>
+  <a class="hotlist-link" href="hotlist.html">Hotlist &amp; alerts</a>
+  <div class="sub">Select a camera node, start auto scan, then place a number plate in front of this phone.</div>
+
+  <div class="card">
+    <label for="cameraSelect">Camera identity</label>
+    <select id="cameraSelect"></select>
+
+    <div class="auto-camera">
+      <label>Automatic phone camera</label>
+      <div class="auto-stage">
+        <video id="autoVideo" autoplay playsinline muted></video>
+        <div id="autoEmpty" class="live-empty">Start auto scan, then place the number plate in front of this phone camera.</div>
+      </div>
+      <canvas id="autoCanvas" hidden></canvas>
+      <div class="meta" id="autoStatus">Auto scan stopped</div>
+      <div class="auto-actions">
+        <button id="startAutoBtn" type="button">Start auto scan</button>
+        <button id="stopAutoBtn" type="button" disabled>Stop</button>
+      </div>
+    </div>
+
+    <label>Optional connected stream preview</label>
+    <div class="live">
+      <img id="liveFrame" alt="Selected camera node feed">
+      <canvas id="overlay"></canvas>
+      <div id="liveEmpty" class="live-empty">RTSP/MJPEG stream preview appears here only when this node has a stream URL connected.</div>
+    </div>
+    <div class="meta" id="streamStatus">Stream offline</div>
+
+    <label for="plateSelection">Plates per image</label>
+    <select id="plateSelection"><option value="all">All detected plates</option><option value="largest">Largest plate</option></select>
+    <label for="fileInput">Plate photos</label>
+    <div class="file-actions">
+      <label class="file-button">Take one photo
+        <input id="cameraInput" type="file" accept="image/*" capture="environment">
+      </label>
+      <label class="file-button">Choose multiple
+        <input id="fileInput" type="file" accept="image/*" multiple>
+      </label>
+    </div>
+
+    <img id="preview" class="preview" alt="preview">
+
+    <button id="submitBtn" class="capture-btn" disabled>Take / choose a photo first</button>
+
+    <div id="result" class="result">
+      <div class="meta" id="resultCamera"></div>
+      <div class="plate" id="resultPlate">—</div>
+      <div class="meta" id="resultStatus"></div>
+    </div>
+    <div id="correction" class="correction">
+      <div class="meta">Verify this read before adding it to the confirmed sighting.</div>
+      <input id="correctedPlate" type="text" maxlength="12" placeholder="Enter the correct plate">
+      <button id="correctBtn" type="button">Confirm corrected plate</button>
+    </div>
+  </div>
+
+  <div class="log">
+    <div class="meta" style="margin-bottom:6px;">This phone's scan log</div>
+    <div id="logList"></div>
+  </div>
+
+<script src="reconnecting-socket.js"></script>
+<script src="hotlist-alerts.js"></script>
+<script>
+const API_ORIGIN = window.location.port === "5500"
+  ? `${window.location.protocol}//${window.location.hostname}:8000`
+  : window.location.origin;
+const DEMO_CAMERAS = [
+  { camera_id: "CAM01", label: "College Main Gate" },
+  { camera_id: "CAM02", label: "SG Highway Junction" },
+  { camera_id: "CAM03", label: "CG Road Crossing" },
+  { camera_id: "CAM04", label: "Parking Exit" },
+];
+
+const cameraSelect = document.getElementById("cameraSelect");
+const cameraInput = document.getElementById("cameraInput");
+const fileInput = document.getElementById("fileInput");
+const preview = document.getElementById("preview");
+const submitBtn = document.getElementById("submitBtn");
+const resultBox = document.getElementById("result");
+const resultCamera = document.getElementById("resultCamera");
+const resultPlate = document.getElementById("resultPlate");
+const resultStatus = document.getElementById("resultStatus");
+const logList = document.getElementById("logList");
+const correction = document.getElementById("correction");
+const correctedPlate = document.getElementById("correctedPlate");
+const correctBtn = document.getElementById("correctBtn");
+let reviewEventId = null;
+
+function isReviewStatus(status) {
+  return ["PENDING_REVIEW", "needs_review"].includes(status);
+}
+
+let selectedFiles = [];
+let cameraSocket = null;
+let snapshotTimer = null;
+let streamConnected = false;
+let autoStream = null;
+let autoTimer = null;
+let autoInFlight = false;
+let autoCooldownUntil = 0;
+const liveFrame = document.getElementById("liveFrame");
+const overlay = document.getElementById("overlay");
+const streamStatus = document.getElementById("streamStatus");
+const liveEmpty = document.getElementById("liveEmpty");
+const autoVideo = document.getElementById("autoVideo");
+const autoCanvas = document.getElementById("autoCanvas");
+const autoEmpty = document.getElementById("autoEmpty");
+const autoStatus = document.getElementById("autoStatus");
+const startAutoBtn = document.getElementById("startAutoBtn");
+const stopAutoBtn = document.getElementById("stopAutoBtn");
+
+function isLocalhost() {
+  return ["localhost", "127.0.0.1", "::1"].includes(window.location.hostname);
+}
+
+function apiUrl(path) {
+  return API_ORIGIN === window.location.origin ? path : `${API_ORIGIN}${path}`;
+}
+
+function wsUrl(path) {
+  return `${API_ORIGIN.replace(/^http/, "ws")}${path}`;
+}
+
+function renderCameraOptions(cams) {
+  cameraSelect.innerHTML = cams
+    .map(c => `<option value="${c.camera_id}">${c.camera_id} — ${c.label}</option>`)
+    .join("");
+  const saved = localStorage.getItem("anpr_camera_id");
+  if (saved && cams.some(c => c.camera_id === saved)) cameraSelect.value = saved;
+  if (!cameraSelect.value && cams.length) cameraSelect.value = cams[0].camera_id;
+}
+
+function fetchWithTimeout(url, options = {}, timeoutMs = 3500) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(new DOMException("Request timed out", "TimeoutError")), timeoutMs);
+  return fetch(url.startsWith("/") ? apiUrl(url) : url, { ...options, signal: controller.signal })
+    .finally(() => clearTimeout(timeout));
+}
+
+function drawOverlay(result) {
+  const ctx = overlay.getContext("2d");
+  overlay.width = liveFrame.naturalWidth || 640;
+  overlay.height = liveFrame.naturalHeight || 360;
+  ctx.clearRect(0, 0, overlay.width, overlay.height);
+  (result?.detections || []).forEach(d => {
+    ctx.strokeStyle = "#37d67a";
+    ctx.lineWidth = 3;
+    ctx.strokeRect(d.x, d.y, d.width, d.height);
+    ctx.fillStyle = "#37d67a";
+    ctx.font = "bold 16px sans-serif";
+    ctx.fillText(d.plate_text || "plate", d.x, Math.max(18, d.y - 6));
+  });
+}
+
+function connectLiveCamera(cameraId) {
+  if (cameraSocket) cameraSocket.close();
+  streamConnected = false;
+  liveFrame.style.display = "none";
+  liveEmpty.style.display = "grid";
+  liveFrame.removeAttribute("src");
+  liveFrame.onload = () => { liveFrame.style.display = streamConnected ? "block" : "none"; liveEmpty.style.display = streamConnected ? "none" : "grid"; };
+  liveFrame.onerror = () => {
+    liveFrame.style.display = "none";
+    liveEmpty.textContent = "This camera node is disconnected or has no stream URL.";
+    liveEmpty.style.display = "grid";
+  };
+  clearInterval(snapshotTimer);
+  snapshotTimer = setInterval(() => {
+    if (!document.hidden && streamConnected && cameraSocket?.readyState === 1) {
+      liveFrame.src = apiUrl(`/api/cameras/${encodeURIComponent(cameraId)}/snapshot?t=${Date.now()}`);
+    }
+  }, 1000);
+  cameraSocket = new ANPRSocket(wsUrl(`/ws/cameras/${encodeURIComponent(cameraId)}`), {
+    onState: state => { streamStatus.textContent = `Stream ${state}`; },
+    onMessage: data => {
+      streamConnected = data.status === "connected";
+      streamStatus.textContent = `Stream ${data.status}`;
+      if (data.status === "connected") {
+        liveFrame.src = apiUrl(`/api/cameras/${encodeURIComponent(cameraId)}/snapshot?t=${Date.now()}`);
+      } else {
+        liveFrame.style.display = "none";
+        liveEmpty.textContent = "Camera disconnected";
+        liveEmpty.style.display = "grid";
+      }
+      drawOverlay(data.result);
+    },
+  });
+}
+
+async function loadCameras() {
+  renderCameraOptions(DEMO_CAMERAS);
+  if (cameraSelect.value) connectLiveCamera(cameraSelect.value);
+  try {
+    const res = await fetchWithTimeout("/api/cameras");
+    const cams = await res.json();
+    renderCameraOptions(cams.length ? cams : DEMO_CAMERAS);
+    if (cameraSelect.value) connectLiveCamera(cameraSelect.value);
+  } catch (e) {
+    renderCameraOptions(DEMO_CAMERAS);
+    streamStatus.textContent = "Backend not ready; using demo camera list";
+  }
+}
+loadCameras();
+
+if (!window.isSecureContext && !isLocalhost()) {
+  autoStatus.textContent = "Auto camera needs HTTPS on phones. Use the HTTPS demo URL, or use manual photo capture.";
+}
+
+cameraSelect.addEventListener("change", () => {
+  localStorage.setItem("anpr_camera_id", cameraSelect.value);
+  connectLiveCamera(cameraSelect.value);
+});
+
+function selectPhotos(files) {
+  selectedFiles = Array.from(files);
+  if (selectedFiles.length) {
+    preview.src = URL.createObjectURL(selectedFiles[0]);
+    preview.style.display = "block";
+    submitBtn.disabled = false;
+    submitBtn.textContent = `Upload ${selectedFiles.length} photo${selectedFiles.length === 1 ? "" : "s"} & scan`;
+    resultBox.style.display = "none";
+  }
+}
+
+cameraInput.addEventListener("change", () => selectPhotos(cameraInput.files));
+fileInput.addEventListener("change", () => selectPhotos(fileInput.files));
+
+function appendLog(itemData) {
+  const item = document.createElement("div");
+  item.className = "log-item";
+  item.innerHTML = `<span>${itemData.plate_text || "—"}</span><span>${itemData.filename || "photo"}</span>`;
+  logList.prepend(item);
+}
+
+function normalizeScanResult(data, filename) {
+  return {
+    duplicate: Boolean(data.duplicate),
+    partial: Boolean(data.partial),
+    bbox: data.bbox || null,
+    event_id: data.event_id ?? null,
+    filename: filename || data.filename || "photo",
+    plate_text: data.plate_text || null,
+    raw_text: data.raw_text || null,
+    confidence: Number(data.confidence || 0),
+    status: data.status || (data.plate_text ? "ok" : "failed"),
+    needs_review: Boolean(data.needs_review),
+    plate_category: data.plate_category || null,
+    layout: data.layout || null,
+    crop_image_path: data.crop_image_path || null,
+    image_path: data.image_path || null,
+    timestamp: data.timestamp || new Date().toISOString(),
+  };
+}
+
+function isAcceptedAutoDetection(item) {
+  return Boolean(
+    item &&
+    item.event_id &&
+    item.plate_text &&
+    item.status === "ok" &&
+    !item.needs_review &&
+    !item.partial &&
+    (item.confidence || 0) >= 0.80
+  );
+}
+
+async function uploadOneFile(file, scanMode = "manual") {
+  const form = new FormData();
+  form.append("camera_id", cameraSelect.value);
+  form.append(scanMode === "auto" ? "frame" : "file", file);
+  const baseEndpoint = scanMode === "auto" ? "/api/process-frame" : "/api/scan";
+  const endpoint = `${baseEndpoint}?selection=${document.getElementById("plateSelection").value}`;
+  const timeoutMs = scanMode === "auto" ? 90000 : 300000;
+  let res;
+  try {
+    res = await fetchWithTimeout(endpoint, { method: "POST", body: form }, timeoutMs);
+  } catch (error) {
+    if (error.name === "AbortError" || error.name === "TimeoutError") {
+      throw new Error("Scan is taking too long. The OCR model may still be warming up; wait a moment and try again.");
+    }
+    throw error;
+  }
+  const responseText = await res.text();
+  let data = {};
+  try {
+    data = responseText ? JSON.parse(responseText) : {};
+  } catch (error) {
+    data = { detail: responseText };
+  }
+  if (!res.ok) {
+    throw new Error(data.detail || `HTTP ${res.status}`);
+  }
+  for (const item of data.detections || [data]) {
+    (item.hotlist_alerts || []).forEach(alert => HotlistAlerts.receive(alert));
+  }
+  let detections = (data.detections || [data]).map(item => normalizeScanResult(item, file.name));
+  if (scanMode === "auto") {
+    detections = detections.filter(isAcceptedAutoDetection);
+  }
+  return { ...normalizeScanResult(data, file.name), detections };
+}
+
+async function uploadFiles(files, label = "photos", scanMode = "manual") {
+  const results = [];
+  for (const file of files) {
+    const response = await uploadOneFile(file, scanMode);
+    results.push(...response.detections);
+  }
+
+  if (scanMode === "auto" && !results.length) {
+    return {
+      camera_id: cameraSelect.value,
+      camera_label: cameraSelect.options[cameraSelect.selectedIndex]?.textContent || cameraSelect.value,
+      best: null,
+      results: [],
+    };
+  }
+
+  const best = results.reduce(
+    (currentBest, item) => ((item.confidence || 0) > (currentBest.confidence || 0) ? item : currentBest),
+    results[0] || { confidence: 0, status: "failed" },
+  );
+  const selectedOption = cameraSelect.options[cameraSelect.selectedIndex];
+  const data = {
+    camera_id: cameraSelect.value,
+    camera_label: selectedOption ? selectedOption.textContent : cameraSelect.value,
+    best,
+    results,
+  };
+
+  resultBox.style.display = "block";
+  resultBox.className = "result " + (best.status === "ok" ? "ok" : (best.needs_review || isReviewStatus(best.status)) ? "review" : "fail");
+  resultCamera.textContent = `${data.camera_label} · ${data.results.length} ${label} checked`;
+  resultPlate.textContent = best.plate_text || best.raw_text || "Not readable";
+  if (best.crop_image_path || best.image_path) {
+    preview.src = apiUrl(best.crop_image_path || best.image_path);
+    preview.style.display = "block";
+  }
+  resultStatus.textContent = best.status === "ok"
+    ? `Best confidence ${(best.confidence * 100).toFixed(0)}%`
+    : best.needs_review || isReviewStatus(best.status)
+    ? "Low confidence — flagged for review"
+    : "Could not read a plate";
+  if (best.duplicate) resultStatus.textContent += " - duplicate skipped";
+  if (best.partial) resultStatus.textContent += " - cropped plate, review required";
+  reviewEventId = best.event_id;
+  correctedPlate.value = best.plate_text || best.raw_text || "";
+  correction.style.display = best.event_id && (best.needs_review || isReviewStatus(best.status)) ? "block" : "none";
+
+  data.results
+    .filter(item => !item.duplicate && (scanMode !== "auto" || isAcceptedAutoDetection(item)))
+    .forEach(appendLog);
+  return data;
+}
+
+submitBtn.addEventListener("click", async () => {
+  if (!selectedFiles.length) return;
+  submitBtn.disabled = true;
+  submitBtn.textContent = `Scanning ${selectedFiles.length} photos...`;
+
+  try {
+    await uploadFiles(selectedFiles, "photos");
+  } catch (e) {
+    resultBox.style.display = "block";
+    resultBox.className = "result fail";
+    resultPlate.textContent = "Upload failed";
+    resultStatus.textContent = e.message || "Check the backend is reachable from this phone.";
+  }
+
+  submitBtn.disabled = false;
+  if (resultBox.className !== "result fail") selectedFiles = [];
+  submitBtn.textContent = "Scan another set";
+  fileInput.value = "";
+  cameraInput.value = "";
+});
+
+async function startAutoScan() {
+  if (!window.isSecureContext && !isLocalhost()) {
+    autoStatus.textContent = "Auto camera is blocked on plain HTTP. Open the HTTPS demo URL from your phone.";
+    return;
+  }
+  if (!navigator.mediaDevices?.getUserMedia) {
+    autoStatus.textContent = "Camera API is not available in this browser.";
+    return;
+  }
+  try {
+    autoStream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: { ideal: "environment" },
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
+      },
+      audio: false,
+    });
+    autoVideo.srcObject = autoStream;
+    await autoVideo.play();
+    autoVideo.style.display = "block";
+    autoEmpty.style.display = "none";
+    startAutoBtn.disabled = true;
+    stopAutoBtn.disabled = false;
+    autoStatus.textContent = "Auto scan running";
+    autoTimer = setInterval(captureAutoFrame, 500);
+    setTimeout(captureAutoFrame, 600);
+  } catch (error) {
+    autoStatus.textContent = "Could not open phone camera. Allow camera permission and use HTTPS or localhost.";
+  }
+}
+
+function stopAutoScan() {
+  if (autoTimer) clearInterval(autoTimer);
+  autoTimer = null;
+  if (autoStream) autoStream.getTracks().forEach(track => track.stop());
+  autoStream = null;
+  autoVideo.srcObject = null;
+  autoVideo.style.display = "none";
+  autoEmpty.style.display = "grid";
+  startAutoBtn.disabled = false;
+  stopAutoBtn.disabled = true;
+  autoStatus.textContent = "Auto scan stopped";
+}
+
+function captureAutoFrame() {
+  if (
+    autoInFlight ||
+    !autoStream ||
+    Date.now() < autoCooldownUntil ||
+    autoVideo.videoWidth <= 0 ||
+    autoVideo.videoHeight <= 0
+  ) return;
+  autoInFlight = true;
+  autoCanvas.width = autoVideo.videoWidth;
+  autoCanvas.height = autoVideo.videoHeight;
+  autoCanvas.getContext("2d").drawImage(autoVideo, 0, 0, autoCanvas.width, autoCanvas.height);
+  autoStatus.textContent = "Scanning current frame...";
+  autoCanvas.toBlob(async blob => {
+    if (!blob) {
+      autoInFlight = false;
+      return;
+    }
+    const file = new File([blob], `auto_${Date.now()}.jpg`, { type: "image/jpeg" });
+    try {
+      const data = await uploadFiles([file], "auto frames", "auto");
+      const best = data.best;
+      if (isAcceptedAutoDetection(best)) {
+        autoStatus.textContent = `Detected ${best.plate_text} · waiting briefly`;
+        autoCooldownUntil = Date.now() + 3000;
+      } else {
+        autoStatus.textContent = "Scanning... hold the plate steady";
+      }
+    } catch (error) {
+      autoStatus.textContent = `Auto upload failed: ${error.message || "check backend and WiFi"}`;
+    } finally {
+      autoInFlight = false;
+    }
+  }, "image/jpeg", 0.82);
+}
+
+startAutoBtn.addEventListener("click", startAutoScan);
+stopAutoBtn.addEventListener("click", stopAutoScan);
+
+correctBtn.addEventListener("click", async () => {
+  const value = correctedPlate.value.trim().toUpperCase();
+  if (!reviewEventId || !value) return;
+  const form = new FormData();
+  form.append("corrected_text", value);
+  correctBtn.disabled = true;
+  try {
+    const res = await fetchWithTimeout(`/api/events/${reviewEventId}/correct`, { method: "POST", body: form }, 30000);
+    if (!res.ok) throw new Error("Correction failed");
+    resultPlate.textContent = value;
+    resultStatus.textContent = "Human-confirmed · confidence 100%";
+    resultBox.className = "result ok";
+    correction.style.display = "none";
+  } catch (error) {
+    resultStatus.textContent = "Could not save correction. Try again.";
+  } finally {
+    correctBtn.disabled = false;
+  }
+});
+window.addEventListener("pagehide", () => { cameraSocket?.close(); clearInterval(snapshotTimer); stopAutoScan(); });
+window.addEventListener("pageshow", event => { if (event.persisted && cameraSelect.value) connectLiveCamera(cameraSelect.value); });
+</script>
+</body>
+</html>

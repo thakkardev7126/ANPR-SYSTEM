@@ -1,0 +1,11 @@
+.hotlist-link { color:#a9d7ff; font-size:14px; padding:8px 0; display:inline-block; }
+#hotlistPopups { position:fixed; z-index:1500; right:16px; bottom:16px; width:min(370px,calc(100vw - 32px)); max-height:48vh; overflow:auto; display:grid; gap:10px; }
+.hotlist-popup { background:#211719; border:1px solid #df7777; color:#fff1f1; padding:16px; border-radius:8px; overflow-wrap:anywhere; box-shadow:0 6px 20px #0006; }
+.hotlist-popup[data-status="review"] { background:#242016; border-color:#ddbc69; color:#fff1c4; }
+.hotlist-popup strong { display:block; font-size:18px; margin:6px 0; }
+.hotlist-popup p { margin:6px 0; font-size:13px; line-height:1.5; }
+.hotlist-popup .hotlist-actions { display:flex; flex-wrap:wrap; gap:12px; align-items:center; margin-top:12px; }
+.hotlist-popup button { font:inherit; font-size:13px; background:#fff1f1; color:#211719; border:0; border-radius:5px; padding:9px 12px; cursor:pointer; }
+.hotlist-popup a { color:inherit; font-size:13px; }
+.hotlist-popup button:disabled { opacity:.65; cursor:wait; }
+.hotlist-popup button:focus-visible, .hotlist-popup a:focus-visible { outline:2px solid #fff; outline-offset:3px; }

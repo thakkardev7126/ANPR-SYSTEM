@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ANPR hotlist</title>
+<link rel="stylesheet" href="hotlist.css">
+<style>
+  * { box-sizing:border-box; letter-spacing:0; }
+  body { margin:0; background:#0b0d12; color:#eef1f5; font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; }
+  header { padding:18px 28px; border-bottom:1px solid #303643; display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; }
+  h1 { font-size:20px; margin:0; }
+  h2 { font-size:17px; margin:0; }
+  nav { display:flex; gap:20px; }
+  a { color:#a9d7ff; }
+  main { max-width:1200px; margin:auto; padding:28px; }
+  section { margin-bottom:36px; min-width:0; }
+  .toolbar { display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin:16px 0; }
+  .toolbar h2 { margin-right:auto; }
+  button, input, select, textarea { font:inherit; }
+  button { cursor:pointer; border:1px solid #52677b; border-radius:5px; background:#1f4e79; color:#fff; padding:9px 14px; }
+  button:hover { background:#2a608d; }
+  button:disabled { opacity:.5; cursor:default; }
+  input, select, textarea { background:#101319; color:#eef1f5; border:1px solid #4a5260; border-radius:5px; padding:9px; min-width:0; max-width:100%; }
+  input[type=checkbox] { width:18px; height:18px; accent-color:#4f9ddd; }
+  label { display:grid; gap:5px; }
+  .inline { display:flex; align-items:center; gap:8px; }
+  :focus-visible { outline:2px solid #a9d7ff; outline-offset:3px; }
+  .table-scroll { overflow:auto; border-top:1px solid #303643; }
+  table { border-collapse:collapse; width:100%; text-align:left; }
+  th { color:#b1b9c5; font-size:12px; font-weight:600; }
+  td, th { padding:12px 10px; border-bottom:1px solid #303643; vertical-align:top; }
+  td { overflow-wrap:anywhere; min-width:105px; max-width:300px; }
+  .plate { font-weight:700; white-space:nowrap; }
+  .muted { color:#b1b9c5; font-size:12px; }
+  .state { color:#8ddcb3; }
+  .state.review { color:#f0cf79; }
+  .state.inactive { color:#b1b9c5; }
+  .error { color:#ffaaa4; min-height:22px; margin:8px 0; }
+  .pager { display:flex; gap:12px; align-items:center; justify-content:flex-end; margin-top:14px; }
+  .edit-button { background:transparent; }
+  dialog { color:#eef1f5; background:#141821; border:1px solid #52677b; border-radius:8px; width:min(520px,calc(100vw - 32px)); max-height:90vh; padding:24px; }
+  dialog::backdrop { background:#0009; }
+  form { display:grid; gap:14px; }
+  form .actions { display:flex; justify-content:flex-end; gap:10px; }
+  @media(max-width:600px) { header, main { padding:16px; } .toolbar > label:not(.inline) { width:100%; } .toolbar input:not([type=checkbox]) { width:100%; } td,th { padding:10px 8px; } }
+</style>
+</head>
+<body>
+<header><h1>Vehicle hotlist</h1><nav><a href="dashboard.html">Dashboard</a><a href="scan.html">Scanner</a></nav></header>
+<main>
+  <section aria-labelledby="entriesTitle">
+    <div class="toolbar"><h2 id="entriesTitle">Registered plates</h2><button id="addEntry">Add plate</button></div>
+    <div class="toolbar"><label>Plate search<input id="entrySearch" type="search" maxlength="120"></label><button id="searchEntries">Search</button></div>
+    <p id="entryError" class="error" role="status"></p>
+    <div class="table-scroll"><table><thead><tr><th>Plate</th><th>Listing</th><th>Reason / reference</th><th>Status</th><th>Expires</th><th>Action</th></tr></thead><tbody id="entryRows"></tbody></table></div>
+    <div class="pager"><button id="entriesPrev" aria-label="Previous hotlist page">Previous</button><span id="entriesCount"></span><button id="entriesNext" aria-label="Next hotlist page">Next</button></div>
+  </section>
+  <section id="alerts" aria-labelledby="alertsTitle">
+    <div class="toolbar"><h2 id="alertsTitle">Alert history</h2><label class="inline"><input id="unacknowledgedOnly" type="checkbox">Unacknowledged only</label><button id="refreshAlerts">Refresh</button></div>
+    <p id="alertError" class="error" role="status"></p>
+    <div class="table-scroll"><table><thead><tr><th>Plate / listing</th><th>Camera / time</th><th>Reason / reference</th><th>Match</th><th>Action</th></tr></thead><tbody id="alertRows"></tbody></table></div>
+    <div class="pager"><button id="alertsPrev" aria-label="Previous alert page">Previous</button><span id="alertsCount"></span><button id="alertsNext" aria-label="Next alert page">Next</button></div>
+  </section>
+</main>
+<dialog id="entryDialog" aria-labelledby="entryTitle">
+  <form id="entryForm">
+    <h2 id="entryTitle">Add hotlist plate</h2>
+    <label>Plate number<input id="entryPlate" maxlength="24" required autocomplete="off"></label>
+    <label>Listing<select id="entryCategory"><option value="stolen">Stolen</option><option value="wanted">Wanted</option><option value="watchlist">Watchlist</option></select></label>
+    <label>Reason<textarea id="entryReason" rows="3" maxlength="500" required></textarea></label>
+    <label>Case / reference<input id="entryReference" maxlength="120"></label>
+    <label>Expires at<input id="entryExpiry" type="datetime-local"></label>
+    <label class="inline"><input id="entryActive" type="checkbox" checked>Active listing</label>
+    <p id="formError" class="error" role="alert"></p>
+    <div class="actions"><button id="cancelEntry" type="button" class="edit-button">Cancel</button><button id="saveEntry" type="submit">Save entry</button></div>
+  </form>
+</dialog>
+<script src="reconnecting-socket.js"></script>
+<script src="hotlist-alerts.js"></script>
+<script src="hotlist.js"></script>
+</body>
+</html>

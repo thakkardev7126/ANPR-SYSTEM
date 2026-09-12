@@ -1,0 +1,15 @@
+event_id,camera_id,original_text,corrected_text,confidence,status_before,image_path,saved_at
+6,CAM01,0524A00024,0524A00024,0.79,PENDING_REVIEW,C:\Users\Dev\Downloads\Model\data\review_feedback\images\event_6_0524A00024.jpg,2026-09-10T04:56:24.039983
+6,CAM01,0524A00024,0524A00024,1.0,ok,C:\Users\Dev\Downloads\Model\data\review_feedback\images\event_6_0524A00024.jpg,2026-09-10T04:56:27.317712
+6,CAM01,0524A00024,0524A00024,1.0,ok,C:\Users\Dev\Downloads\Model\data\review_feedback\images\event_6_0524A00024.jpg,2026-09-10T04:56:31.576354
+6,CAM01,0524A00024,0524A00024,1.0,ok,C:\Users\Dev\Downloads\Model\data\review_feedback\images\event_6_0524A00024.jpg,2026-09-10T04:56:33.372201
+6,CAM01,0524A00024,0524A00024,1.0,ok,C:\Users\Dev\Downloads\Model\data\review_feedback\images\event_6_0524A00024.jpg,2026-09-10T04:56:34.818689
+10,CAM01,PAN,PAN,0.79,PENDING_REVIEW,C:\Users\Dev\Downloads\Model\data\review_feedback\images\event_10_PAN.jpg,2026-09-10T04:59:01.193522
+7,CAM01,2,2,0.79,PENDING_REVIEW,C:\Users\Dev\Downloads\Model\data\review_feedback\images\event_7_2.jpg,2026-09-10T05:00:06.021863
+64,CAM04,K18,GJ01HV8768,0.79,PENDING_REVIEW,C:\Users\Dev\Downloads\Model\data\review_feedback\images\event_64_GJ01HV8768.jpg,2026-09-11T17:56:56.657112
+125,CAM03,22BH6517A,22BH6517A,0.79,PENDING_REVIEW,C:\Users\Dev\Downloads\Model\data\review_feedback\images\event_125_22BH6517A.jpg,2026-09-11T18:26:31.518534
+12,CAM04,K18,K18,0.79,PENDING_REVIEW,C:\Users\Dev\Downloads\Model\data\review_feedback\images\event_12_K18.jpg,2026-09-12T18:31:43.174361
+19,CAM04,MA08BZM,MA08BZM,0.79,PENDING_REVIEW,C:\Users\Dev\Downloads\Model\data\review_feedback\images\event_19_MA08BZM.jpg,2026-09-12T18:32:24.630401
+23,CAM04,ELCS777,5LCS777,0.79,PENDING_REVIEW,C:\Users\Dev\Downloads\Model\data\review_feedback\images\event_23_5LCS777.jpg,2026-09-12T18:39:57.594825
+33,CAM04,MH14,MH14GN9239,0.79,PENDING_REVIEW,C:\Users\Dev\Downloads\Model\data\review_feedback\images\event_33_MH14GN9239.jpg,2026-09-12T18:51:25.918326
+39,CAM04,LA2IKMP,LA2IKMP,0.79,PENDING_REVIEW,C:\Users\Dev\Downloads\Model\data\review_feedback\images\event_39_LA2IKMP.jpg,2026-09-12T18:53:30.730041
