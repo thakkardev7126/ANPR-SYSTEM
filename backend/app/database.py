@@ -137,6 +137,89 @@ class VehicleMatchCandidate(Base):
     reviewed_by = Column(String, nullable=True)
 
 
+class VehicleAnomaly(Base):
+    """Persisted explainable trajectory anomaly such as impossible travel."""
+    __tablename__ = "vehicle_anomalies"
+    __table_args__ = (
+        UniqueConstraint("anomaly_type", "source_event_id", "destination_event_id", name="uq_vehicle_anomaly_pair"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    vehicle_id = Column(String, nullable=True, index=True)
+    plate_text = Column(String(24), nullable=True, index=True)
+    anomaly_type = Column(String, nullable=False, index=True)
+    severity = Column(String, nullable=False, index=True)
+    status = Column(String, nullable=False, default="active", index=True)
+    source_event_id = Column(Integer, nullable=False, index=True)
+    destination_event_id = Column(Integer, nullable=False, index=True)
+    source_camera_id = Column(String, nullable=False)
+    destination_camera_id = Column(String, nullable=False)
+    detected_at = Column(DateTime, nullable=False, index=True)
+    travel_time_seconds = Column(Float, nullable=True)
+    road_distance_meters = Column(Float, nullable=True)
+    estimated_speed_kmh = Column(Float, nullable=True)
+    allowed_speed_kmh = Column(Float, nullable=True)
+    excess_ratio = Column(Float, nullable=True)
+    road_type = Column(String, nullable=True)
+    road_name = Column(String, nullable=True)
+    policy = Column(Text, nullable=True)
+    explanation = Column(Text, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+    acknowledged_at = Column(DateTime, nullable=True)
+    resolved_at = Column(DateTime, nullable=True)
+
+
+class PlateSuspicionEvent(Base):
+    """Explainable possible cloned-plate evidence for one valid plate observation pair."""
+    __tablename__ = "plate_suspicion_events"
+    __table_args__ = (
+        UniqueConstraint("plate_text", "source_event_id", "destination_event_id", name="uq_plate_suspicion_pair"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    plate_text = Column(String(24), nullable=False, index=True)
+    vehicle_id = Column(String, nullable=True, index=True)
+    source_event_id = Column(Integer, nullable=False, index=True)
+    destination_event_id = Column(Integer, nullable=False, index=True)
+    source_camera_id = Column(String, nullable=True)
+    destination_camera_id = Column(String, nullable=True)
+    suspicion_score = Column(Float, nullable=False, default=0.0)
+    classification = Column(String, nullable=False, default="normal", index=True)
+    status = Column(String, nullable=False, default="open", index=True)
+    evidence = Column(Text, nullable=False)
+    appearance_similarity = Column(Float, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow, index=True)
+    updated_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+    reviewed_at = Column(DateTime, nullable=True)
+    reviewed_by = Column(String, nullable=True)
+
+
+class RouteAnomalyEvent(Base):
+    """Explainable anomaly over a vehicle trajectory window."""
+    __tablename__ = "route_anomaly_events"
+    __table_args__ = (
+        UniqueConstraint("vehicle_id", "start_event_id", "end_event_id", name="uq_route_anomaly_window"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    vehicle_id = Column(String, nullable=False, index=True)
+    plate_text = Column(String(24), nullable=True, index=True)
+    start_event_id = Column(Integer, nullable=False, index=True)
+    end_event_id = Column(Integer, nullable=False, index=True)
+    start_camera_id = Column(String, nullable=True)
+    end_camera_id = Column(String, nullable=True)
+    route_signature = Column(String, nullable=False)
+    route_anomaly_score = Column(Float, nullable=False, default=0.0)
+    classification = Column(String, nullable=False, default="normal", index=True)
+    status = Column(String, nullable=False, default="open", index=True)
+    evidence = Column(Text, nullable=False)
+    explanation = Column(Text, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow, index=True)
+    updated_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+    reviewed_at = Column(DateTime, nullable=True)
+    reviewed_by = Column(String, nullable=True)
+
+
 class HotlistEntry(Base):
     __tablename__ = "hotlist_entries"
     id = Column(Integer, primary_key=True)
@@ -360,6 +443,93 @@ def _ensure_sqlite_columns():
         connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_camera_road_source ON camera_road_connections(source_camera_id)")
         connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_camera_road_destination ON camera_road_connections(destination_camera_id)")
         connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_camera_road_active ON camera_road_connections(active)")
+        connection.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS vehicle_anomalies (
+                id INTEGER PRIMARY KEY,
+                vehicle_id VARCHAR,
+                plate_text VARCHAR(24),
+                anomaly_type VARCHAR NOT NULL,
+                severity VARCHAR NOT NULL,
+                status VARCHAR NOT NULL DEFAULT 'active',
+                source_event_id INTEGER NOT NULL,
+                destination_event_id INTEGER NOT NULL,
+                source_camera_id VARCHAR NOT NULL,
+                destination_camera_id VARCHAR NOT NULL,
+                detected_at DATETIME NOT NULL,
+                travel_time_seconds FLOAT,
+                road_distance_meters FLOAT,
+                estimated_speed_kmh FLOAT,
+                allowed_speed_kmh FLOAT,
+                excess_ratio FLOAT,
+                road_type VARCHAR,
+                road_name VARCHAR,
+                policy TEXT,
+                explanation TEXT NOT NULL,
+                created_at DATETIME NOT NULL,
+                acknowledged_at DATETIME,
+                resolved_at DATETIME,
+                CONSTRAINT uq_vehicle_anomaly_pair UNIQUE (anomaly_type, source_event_id, destination_event_id)
+            )
+        """)
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_vehicle_anomaly_vehicle ON vehicle_anomalies(vehicle_id)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_vehicle_anomaly_plate ON vehicle_anomalies(plate_text)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_vehicle_anomaly_type ON vehicle_anomalies(anomaly_type)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_vehicle_anomaly_severity ON vehicle_anomalies(severity)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_vehicle_anomaly_status ON vehicle_anomalies(status)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_vehicle_anomaly_detected ON vehicle_anomalies(detected_at)")
+        connection.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS plate_suspicion_events (
+                id INTEGER PRIMARY KEY,
+                plate_text VARCHAR(24) NOT NULL,
+                vehicle_id VARCHAR,
+                source_event_id INTEGER NOT NULL,
+                destination_event_id INTEGER NOT NULL,
+                source_camera_id VARCHAR,
+                destination_camera_id VARCHAR,
+                suspicion_score FLOAT NOT NULL DEFAULT 0.0,
+                classification VARCHAR NOT NULL DEFAULT 'normal',
+                status VARCHAR NOT NULL DEFAULT 'open',
+                evidence TEXT NOT NULL,
+                appearance_similarity FLOAT,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL,
+                reviewed_at DATETIME,
+                reviewed_by VARCHAR,
+                CONSTRAINT uq_plate_suspicion_pair UNIQUE (plate_text, source_event_id, destination_event_id)
+            )
+        """)
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_plate_suspicion_plate ON plate_suspicion_events(plate_text)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_plate_suspicion_vehicle ON plate_suspicion_events(vehicle_id)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_plate_suspicion_classification ON plate_suspicion_events(classification)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_plate_suspicion_status ON plate_suspicion_events(status)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_plate_suspicion_created ON plate_suspicion_events(created_at)")
+        connection.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS route_anomaly_events (
+                id INTEGER PRIMARY KEY,
+                vehicle_id VARCHAR NOT NULL,
+                plate_text VARCHAR(24),
+                start_event_id INTEGER NOT NULL,
+                end_event_id INTEGER NOT NULL,
+                start_camera_id VARCHAR,
+                end_camera_id VARCHAR,
+                route_signature VARCHAR NOT NULL,
+                route_anomaly_score FLOAT NOT NULL DEFAULT 0.0,
+                classification VARCHAR NOT NULL DEFAULT 'normal',
+                status VARCHAR NOT NULL DEFAULT 'open',
+                evidence TEXT NOT NULL,
+                explanation TEXT NOT NULL,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL,
+                reviewed_at DATETIME,
+                reviewed_by VARCHAR,
+                CONSTRAINT uq_route_anomaly_window UNIQUE (vehicle_id, start_event_id, end_event_id)
+            )
+        """)
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_route_anomaly_vehicle ON route_anomaly_events(vehicle_id)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_route_anomaly_plate ON route_anomaly_events(plate_text)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_route_anomaly_classification ON route_anomaly_events(classification)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_route_anomaly_status ON route_anomaly_events(status)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_route_anomaly_created ON route_anomaly_events(created_at)")
         existing = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(cameras)")}
         for name, definition in columns.items():
             if name not in existing:
@@ -414,6 +584,12 @@ def persist_plate_event(values, window_seconds=None):
             match_event(db, previous)
             from app.vehicle_matching import process_observation_matches
             process_observation_matches(db, previous)
+            from app.anomalies import process_event_anomalies
+            process_event_anomalies(db, previous)
+            from app.plate_suspicion import process_plate_suspicions
+            process_plate_suspicions(db, previous)
+            from app.route_anomaly import process_route_anomalies
+            process_route_anomalies(db, previous)
             db.commit()
             return previous, True
         event = PlateEvent(**values)
@@ -424,6 +600,12 @@ def persist_plate_event(values, window_seconds=None):
         match_event(db, event)
         from app.vehicle_matching import process_observation_matches
         process_observation_matches(db, event)
+        from app.anomalies import process_event_anomalies
+        process_event_anomalies(db, event)
+        from app.plate_suspicion import process_plate_suspicions
+        process_plate_suspicions(db, event)
+        from app.route_anomaly import process_route_anomalies
+        process_route_anomalies(db, event)
         db.commit()
         return event, False
 

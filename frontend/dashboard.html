@@ -119,6 +119,10 @@
     <div id="roadNetworkList" class="hop-list" style="margin-bottom:20px">
       <div class="empty">No configured camera road connections.</div>
     </div>
+    <h2>Urban traffic analytics</h2>
+    <div id="trafficAnalytics" class="review-list">
+      <div class="empty">Traffic analytics will appear after observations are available.</div>
+    </div>
     <h2>Review queue</h2>
     <div id="reviewList" class="review-list">
       <div class="empty">No low-confidence scans waiting.</div>
@@ -126,6 +130,18 @@
     <h2>Match review</h2>
     <div id="matchReviewList" class="review-list">
       <div class="empty">No vehicle match candidates waiting.</div>
+    </div>
+    <h2>Trajectory anomalies</h2>
+    <div id="anomalyList" class="review-list">
+      <div class="empty">No impossible-travel warnings.</div>
+    </div>
+    <h2>Possible cloned plates</h2>
+    <div id="plateSuspicionList" class="review-list">
+      <div class="empty">No suspicious plate evidence.</div>
+    </div>
+    <h2>Route anomalies</h2>
+    <div id="routeAnomalyList" class="review-list">
+      <div class="empty">No route anomalies.</div>
     </div>
     <h2>Fuzzy GIS search</h2>
     <div class="search-wrap">
@@ -150,6 +166,10 @@
     </div>
     <div id="hopList" class="hop-list">
       <div class="empty">Select a vehicle on the left to see its path.</div>
+    </div>
+    <h2>Vehicle investigation</h2>
+    <div id="investigationPanel" class="review-list">
+      <div class="empty">Select a vehicle to see explainable investigation evidence.</div>
     </div>
   </div>
 </main>
@@ -185,6 +205,7 @@ let streamConnected = false;
 let leafletMap = null;
 let cameraLayer = null;
 let routeLayer = null;
+let trafficHeatmap = [];
 const liveFrame = document.getElementById("liveFrame");
 const overlay = document.getElementById("overlay");
 const streamEmpty = document.getElementById("streamEmpty");
@@ -245,13 +266,17 @@ function renderMap(hops) {
   const bounds = [];
   cameras.forEach(camera => {
     if (camera.lat == null || camera.lng == null) return;
+    const heat = trafficHeatmap.find(item => item.camera_id === camera.camera_id);
+    const count = heat?.traffic_count || 0;
+    const density = heat?.density_level || "LOW";
+    const fill = density === "HIGH" ? "#d9534f" : density === "MEDIUM" ? "#d9a441" : "#1F4E79";
     const marker = L.circleMarker([camera.lat, camera.lng], {
-      radius: 6,
+      radius: Math.min(18, 6 + Math.sqrt(count) * 2),
       color: "#8b93a0",
-      fillColor: "#1F4E79",
+      fillColor: fill,
       fillOpacity: 0.85,
       weight: 2,
-    }).bindPopup(`<strong>${camera.camera_id}</strong><br>${camera.label}`);
+    }).bindPopup(`<strong>${camera.camera_id}</strong><br>${camera.label}<br>Traffic: ${count}<br>Density: ${density}`);
     marker.addTo(cameraLayer);
     bounds.push([camera.lat, camera.lng]);
   });
@@ -294,6 +319,55 @@ async function loadRoadNetwork() {
   `).join("");
 }
 
+function trafficBadge(status) {
+  const value = String(status || "").toUpperCase();
+  if (["HIGH", "CONGESTED"].includes(value)) return "bad";
+  if (["MEDIUM", "WATCH"].includes(value)) return "warn";
+  return "ok";
+}
+
+async function loadTrafficAnalytics() {
+  const data = await fetchJSON("/api/traffic/dashboard?bucket=hour");
+  trafficHeatmap = data.heatmap || [];
+  const box = document.getElementById("trafficAnalytics");
+  const summary = data.summary || {};
+  const busiestCamera = summary.busiest_camera;
+  const busiestRoad = summary.busiest_road;
+  const flows = (data.flow || []).slice(0, 4);
+  const od = (data.od_matrix || []).slice(0, 4);
+  const congested = (data.congestion || []).slice(0, 4);
+  box.innerHTML = `
+    <div class="review-item" style="grid-template-columns:1fr">
+      <div class="review-body">
+        <div class="plate">${summary.total_observations || 0} observations · ${summary.unique_vehicle_count || 0} unique vehicles</div>
+        <div class="meta">Busiest camera: ${busiestCamera ? `${busiestCamera.camera_id} (${busiestCamera.observation_count})` : "none"}</div>
+        <div class="meta">Busiest road: ${busiestRoad ? `${busiestRoad.source_camera_id} → ${busiestRoad.destination_camera_id} (${busiestRoad.movement_count})` : "none"}</div>
+        <div class="meta">Average road speed: ${summary.average_road_speed_kmh != null ? `${Number(summary.average_road_speed_kmh).toFixed(1)} km/h` : "not available"} · Lane analysis ${summary.lane_analysis || "not configured"}</div>
+      </div>
+    </div>
+    <div class="review-item" style="grid-template-columns:1fr">
+      <div class="review-body">
+        <div class="plate">Traffic flow</div>
+        ${flows.length ? flows.map(item => `<div class="meta">${item.origin} → ${item.destination}: ${item.vehicle_count} vehicle(s), ${item.movement_count} movement(s)</div>`).join("") : `<div class="meta">No direct movement yet.</div>`}
+      </div>
+    </div>
+    <div class="review-item" style="grid-template-columns:1fr">
+      <div class="review-body">
+        <div class="plate">O-D matrix</div>
+        ${od.length ? od.map(item => `<div class="meta">${item.time_bucket} · ${item.origin} → ${item.destination}: ${item.vehicle_count}</div>`).join("") : `<div class="meta">No O-D movements yet.</div>`}
+      </div>
+    </div>
+    <div class="review-item" style="grid-template-columns:1fr">
+      <div class="review-body">
+        <div class="plate">Congestion</div>
+        ${congested.length ? congested.map(item => `
+          <div class="meta"><span class="badge ${trafficBadge(item.congestion_status)}">${item.congestion_status}</span> ${item.source_camera_id} → ${item.destination_camera_id}: ${item.average_estimated_speed_kmh != null ? `${Number(item.average_estimated_speed_kmh).toFixed(1)} km/h` : "speed unavailable"} · ${item.movement_count} movement(s)</div>
+        `).join("") : `<div class="meta">No road-speed data yet.</div>`}
+      </div>
+    </div>
+  `;
+}
+
 function formatDuration(seconds) {
   if (seconds == null) return "Not available";
   const total = Math.round(Number(seconds));
@@ -314,23 +388,60 @@ function speedLine(item) {
   return `<div class="time">Speed: Not available · ${reason}</div>`;
 }
 
-function renderHops(hops) {
+function anomalyLine(item) {
+  if (!item || !["warning", "impossible_travel"].includes(item.anomaly_status)) return "";
+  const evidence = item.anomaly_evidence || {};
+  const label = item.anomaly_status === "impossible_travel" ? "IMPOSSIBLE TRAVEL" : "Unusually fast travel";
+  const cls = item.anomaly_status === "impossible_travel" ? "bad" : "warn";
+  const allowed = evidence.allowed_speed_kmh != null ? `${Number(evidence.allowed_speed_kmh).toFixed(0)} km/h` : "policy limit";
+  const excess = evidence.excess_ratio != null ? ` · ${Number(evidence.excess_ratio).toFixed(2)}x` : "";
+  return `<div class="time"><span class="badge ${cls}">${label}</span> Max ${allowed}${excess}</div>`;
+}
+
+function plateSuspicionLine(item) {
+  if (!item || !["suspicious", "high_suspicion"].includes(item.plate_suspicion_status)) return "";
+  const label = item.plate_suspicion_status === "high_suspicion" ? "High suspicion" : "Possible cloned plate";
+  const cls = item.plate_suspicion_status === "high_suspicion" ? "bad" : "warn";
+  const score = Number(item.plate_suspicion_score || 0).toFixed(1);
+  const reasons = (item.plate_suspicion_evidence || []).map(e => (e.type || "").replaceAll("_", " ")).filter(Boolean).slice(0, 3).join(", ");
+  return `<div class="time"><span class="badge ${cls}">${label}</span> Score ${score}${reasons ? ` · ${reasons}` : ""}</div>`;
+}
+
+function routeAnomalyLine(item) {
+  if (!item || !["unusual_route", "high_route_anomaly"].includes(item.route_anomaly_status)) return "";
+  const label = item.route_anomaly_status === "high_route_anomaly" ? "ROUTE ANOMALY" : "Unusual route";
+  const cls = item.route_anomaly_status === "high_route_anomaly" ? "bad" : "warn";
+  const score = Number(item.route_anomaly_score || 0).toFixed(1);
+  const evidence = item.route_anomaly_evidence || {};
+  const deviation = evidence.route_deviation_ratio != null ? ` · deviation ${(Number(evidence.route_deviation_ratio) * 100).toFixed(0)}%` : "";
+  return `<div class="time"><span class="badge ${cls}">${label}</span> Score ${score}${deviation}</div>`;
+}
+
+function renderHops(hops, trajectoryHops = []) {
   const list = document.getElementById("hopList");
   if (!hops || !hops.length) {
     list.innerHTML = `<div class="empty">No sightings yet.</div>`;
     return;
   }
+  const transitionsByEndEvent = new Map((trajectoryHops || []).map(segment => [segment.end_event_id, segment]));
   list.innerHTML = hops.map((h, i) => {
+    const transition = transitionsByEndEvent.get(h.event_id) || h;
     let badge = `<span class="badge ok">confirmed</span>`;
     if (isReviewStatus(h.status)) badge = `<span class="badge warn">low confidence</span>`;
     if (i > 0 && !h.plausible) badge = `<span class="badge bad">too fast — check</span>`;
     const elapsed = h.elapsed_minutes != null ? ` · +${h.elapsed_minutes} min` : "";
+    const continuity = transition?.continuity && transition.continuity !== "connected"
+      ? `<div class="time">Continuity: ${transition.continuity.replaceAll("_", " ")}</div>` : "";
     return `
       <div class="hop ${i > 0 && !h.plausible ? "implausible" : ""}">
         <div>
           <div class="cam">${i + 1}. ${h.camera_label}</div>
           <div class="time">${new Date(h.timestamp).toLocaleTimeString()}${elapsed}</div>
-          ${i > 0 ? speedLine(h) : ""}
+          ${i > 0 ? speedLine(transition) : ""}
+          ${i > 0 ? anomalyLine(transition) : ""}
+          ${i > 0 ? plateSuspicionLine(transition) : ""}
+          ${i > 0 ? routeAnomalyLine(transition) : ""}
+          ${i > 0 ? continuity : ""}
         </div>
         ${badge}
       </div>`;
@@ -345,6 +456,7 @@ function renderVehicleHistory(history, speedHistory = null) {
     return;
   }
   const segmentsByEndEvent = new Map((speedHistory?.segments || []).map(segment => [segment.end_event_id, segment]));
+  const trajectoryByEndEvent = new Map((history?.trajectory_hops || []).map(segment => [segment.end_event_id, segment]));
   list.innerHTML = observations.map((observation, index) => `
     <div class="hop">
       <div>
@@ -353,10 +465,87 @@ function renderVehicleHistory(history, speedHistory = null) {
         <div class="time">${observation.global_vehicle_id}</div>
         <div class="time">${observation.vehicle_color || "Color unavailable"} · ${observation.vehicle_type || "Type unavailable"} · Appearance ${observation.appearance_available ? "available" : "unavailable"}</div>
         ${index > 0 ? speedLine(segmentsByEndEvent.get(observation.event_id)) : ""}
+        ${index > 0 ? anomalyLine(trajectoryByEndEvent.get(observation.event_id)) : ""}
+        ${index > 0 ? plateSuspicionLine(trajectoryByEndEvent.get(observation.event_id)) : ""}
+        ${index > 0 ? routeAnomalyLine(trajectoryByEndEvent.get(observation.event_id)) : ""}
       </div>
       <span class="badge ${isReviewStatus(observation.plate_status) ? "warn" : "ok"}">${observation.plate_status}</span>
     </div>
   `).join("");
+}
+
+function evidenceLabel(value) {
+  return String(value || "").replaceAll("_", " ");
+}
+
+function renderInvestigation(data) {
+  const panel = document.getElementById("investigationPanel");
+  if (!data || !data.summary) {
+    panel.innerHTML = `<div class="empty">No investigation data available.</div>`;
+    return;
+  }
+  const summary = data.summary;
+  const explanations = data.explanations || data.why_flagged || [];
+  const timeline = (data.timeline || []).slice(0, 8);
+  const appearance = data.appearance || {};
+  const plateItems = data.plate_suspicions?.items || [];
+  const routeItems = data.route_anomalies?.items || [];
+  const actionButtons = [
+    ...plateItems.filter(item => item.status === "open").slice(0, 2).map(item =>
+      `<button type="button" data-review-kind="plate" data-review-id="${item.id}" data-review-status="acknowledged">Acknowledge plate</button>`),
+    ...routeItems.filter(item => item.status === "open").slice(0, 2).map(item =>
+      `<button type="button" data-review-kind="route" data-review-id="${item.id}" data-review-status="acknowledged">Acknowledge route</button>`),
+  ].join("");
+  panel.innerHTML = `
+    <div class="review-item" style="grid-template-columns:1fr">
+      <div class="review-body">
+        <div class="plate">${summary.global_vehicle_id}</div>
+        <div class="meta">${summary.primary_plate_text || "No confirmed plate"} · ${summary.status_summary}</div>
+        <div class="meta">${summary.observation_count} observations · ${summary.camera_count} cameras · ${summary.trajectory_segment_count} trajectory segments</div>
+        <div class="meta">Plate suspicion: ${evidenceLabel(summary.plate_suspicion)} · Route anomaly: ${evidenceLabel(summary.route_anomaly)} · Anomalies: ${summary.anomaly_count}</div>
+      </div>
+    </div>
+    <div class="review-item" style="grid-template-columns:1fr">
+      <div class="review-body">
+        <div class="plate">Why flagged</div>
+        ${explanations.length ? explanations.slice(0, 6).map(item => `
+          <div class="meta"><span class="badge ${item.severity === "warning" ? "warn" : item.severity === "critical" ? "bad" : "ok"}">${evidenceLabel(item.type)}</span> ${item.summary || item.title}</div>
+        `).join("") : `<div class="meta">No concern evidence currently stored for this vehicle.</div>`}
+        ${actionButtons ? `<div class="review-row">${actionButtons}</div>` : ""}
+      </div>
+    </div>
+    <div class="review-item" style="grid-template-columns:1fr">
+      <div class="review-body">
+        <div class="plate">Appearance</div>
+        <div class="meta">${appearance.available_observation_count || 0} observations have appearance data.</div>
+        ${(appearance.comparisons || []).slice(0, 4).map(item => `
+          <div class="meta">#${item.left_event_id} ↔ #${item.right_event_id}: ${item.appearance_similarity_percent != null ? `${item.appearance_similarity_percent}%` : "unavailable"} · ${evidenceLabel(item.assessment)}</div>
+        `).join("") || `<div class="meta">No appearance comparisons available.</div>`}
+      </div>
+    </div>
+    <div class="review-item" style="grid-template-columns:1fr">
+      <div class="review-body">
+        <div class="plate">Evidence timeline</div>
+        ${timeline.length ? timeline.map(item => `
+          <div class="meta">${item.timestamp ? new Date(item.timestamp).toLocaleString() : "No timestamp"} · ${item.camera_id || ""} · ${item.label}</div>
+        `).join("") : `<div class="meta">No timeline evidence available.</div>`}
+      </div>
+    </div>
+  `;
+}
+
+async function reviewInvestigationItem(kind, id, status) {
+  const path = kind === "plate" ? `/api/plate-suspicions/${id}/review` : `/api/route-anomalies/${id}/review`;
+  const response = await fetch(`${API_BASE}${path}`, {
+    method: "PATCH",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({ status, reviewed_by: "dashboard" }),
+  });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  if (selectedVehicleId) {
+    const investigation = await fetchJSON(`/api/vehicles/${encodeURIComponent(selectedVehicleId)}/investigation`);
+    renderInvestigation(investigation);
+  }
 }
 
 function drawOverlay(result) {
@@ -472,13 +661,26 @@ async function selectVehicle(plate, vehicleId) {
         let speedHistory = null;
         try { speedHistory = await fetchJSON(`/api/vehicles/${encodeURIComponent(selectedVehicleId)}/speed-history`); } catch (error) {}
         renderVehicleHistory(history, speedHistory);
+        try {
+          const investigation = await fetchJSON(`/api/vehicles/${encodeURIComponent(selectedVehicleId)}/investigation`);
+          renderInvestigation(investigation);
+        } catch (error) {
+          renderInvestigation(null);
+        }
       } catch (error) {
-        renderHops(data.hops);
+        renderHops(data.hops, data.trajectory_hops || data.segments || []);
+        renderInvestigation(null);
       }
     } else {
-      renderHops(data.hops);
+      renderHops(data.hops, data.trajectory_hops || data.segments || []);
+      try {
+        const investigation = await fetchJSON(`/api/plates/${encodeURIComponent(plate)}/investigation`);
+        renderInvestigation(investigation);
+      } catch (error) {
+        renderInvestigation(null);
+      }
     }
-  } catch (error) { renderMap([]); renderHops([]); }
+  } catch (error) { renderMap([]); renderHops([]); renderInvestigation(null); }
 }
 
 async function loadStats() {
@@ -577,6 +779,98 @@ async function loadMatchQueue() {
   });
 }
 
+async function loadAnomalyQueue() {
+  const data = await fetchJSON("/api/anomalies?anomaly_type=impossible_travel&limit=6");
+  const list = document.getElementById("anomalyList");
+  if (!data.items.length) {
+    list.innerHTML = `<div class="empty">No impossible-travel warnings.</div>`;
+    return;
+  }
+  list.innerHTML = data.items.map(item => `
+    <div class="review-item">
+      <div class="review-body" style="grid-column:1 / -1">
+        <div class="plate">${item.plate_text || "Unknown plate"} · ${item.severity}</div>
+        <div class="meta">${item.source_camera_id} → ${item.destination_camera_id} · ${Number(item.estimated_speed_kmh || 0).toFixed(1)} km/h vs ${Number(item.allowed_speed_kmh || 0).toFixed(0)} km/h</div>
+        <div class="meta">${item.global_vehicle_id || "No vehicle ID"} · ${item.explanation}</div>
+      </div>
+    </div>
+  `).join("");
+}
+
+async function loadPlateSuspicionQueue() {
+  const data = await fetchJSON("/api/plate-suspicions?limit=6");
+  const list = document.getElementById("plateSuspicionList");
+  if (!data.items.length) {
+    list.innerHTML = `<div class="empty">No suspicious plate evidence.</div>`;
+    return;
+  }
+  list.innerHTML = data.items.map(item => {
+    const reasons = (item.evidence || []).map(e => (e.type || "").replaceAll("_", " ")).filter(Boolean).slice(0, 3).join(", ");
+    return `
+      <div class="review-item" data-suspicion-id="${item.id}">
+        <div class="review-body">
+          <div class="plate">${item.plate_text} · ${item.classification.replaceAll("_", " ")}</div>
+          <div class="meta">${item.source_camera_id} → ${item.destination_camera_id} · score ${Number(item.suspicion_score || 0).toFixed(1)}</div>
+          <div class="meta">${reasons || item.explanation || "Evidence available for review"}</div>
+        </div>
+        <div class="review-actions">
+          <button data-status="acknowledged">Acknowledge</button>
+          <button data-status="dismissed">Dismiss</button>
+        </div>
+      </div>`;
+  }).join("");
+  list.querySelectorAll("button").forEach(button => {
+    button.addEventListener("click", async () => {
+      const item = button.closest(".review-item");
+      const response = await fetch(`${API_BASE}/api/plate-suspicions/${item.dataset.suspicionId}/review`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: button.dataset.status }),
+      });
+      if (response.ok) await refresh();
+    });
+  });
+}
+
+async function loadRouteAnomalyQueue() {
+  const data = await fetchJSON("/api/route-anomalies?limit=6");
+  const list = document.getElementById("routeAnomalyList");
+  if (!data.items.length) {
+    list.innerHTML = `<div class="empty">No route anomalies.</div>`;
+    return;
+  }
+  list.innerHTML = data.items.map(item => {
+    const evidence = item.evidence || {};
+    const disconnected = evidence.disconnected_transitions?.length || 0;
+    const unseen = evidence.unseen_transition_count || 0;
+    const deviation = evidence.route_deviation_ratio != null ? `${(Number(evidence.route_deviation_ratio) * 100).toFixed(0)}%` : "n/a";
+    return `
+      <div class="review-item" data-route-anomaly-id="${item.id}">
+        <div class="review-body">
+          <div class="plate">${item.plate_text || item.global_vehicle_id} · ${item.classification.replaceAll("_", " ")}</div>
+          <div class="meta">${item.route_signature} · score ${Number(item.route_anomaly_score || 0).toFixed(1)} · deviation ${deviation}</div>
+          <div class="meta">${unseen} unseen transition(s) · ${disconnected} disconnected transition(s)</div>
+          <div class="meta">${item.explanation}</div>
+        </div>
+        <div class="review-actions">
+          <button data-status="acknowledged">Acknowledge</button>
+          <button data-status="dismissed">Dismiss</button>
+        </div>
+      </div>`;
+  }).join("");
+  list.querySelectorAll("button").forEach(button => {
+    button.addEventListener("click", async () => {
+      const item = button.closest(".review-item");
+      const response = await fetch(`${API_BASE}/api/route-anomalies/${item.dataset.routeAnomalyId}/review`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: button.dataset.status }),
+      });
+      if (response.ok) await refresh();
+    });
+  });
+}
+
 async function searchSightings() {
   const plate = document.getElementById("searchPlate").value.trim().toUpperCase();
   const resultsBox = document.getElementById("searchResults");
@@ -644,6 +938,7 @@ async function clearHistory() {
   selectedVehicleId = null;
   renderMap([]);
   document.getElementById("hopList").innerHTML = `<div class="empty">Select a vehicle on the left to see its path.</div>`;
+  document.getElementById("investigationPanel").innerHTML = `<div class="empty">Select a vehicle to see explainable investigation evidence.</div>`;
   await refresh();
 }
 
@@ -651,6 +946,14 @@ document.getElementById("clearHistory").addEventListener("click", clearHistory);
 document.getElementById("searchBtn").addEventListener("click", searchSightings);
 document.getElementById("searchPlate").addEventListener("keydown", event => {
   if (event.key === "Enter") searchSightings();
+});
+document.getElementById("investigationPanel").addEventListener("click", async event => {
+  const button = event.target.closest("button[data-review-kind]");
+  if (!button) return;
+  try {
+    await reviewInvestigationItem(button.dataset.reviewKind, button.dataset.reviewId, button.dataset.reviewStatus);
+    await refresh();
+  } catch (error) {}
 });
 
 async function refresh() {
@@ -668,14 +971,33 @@ async function refresh() {
   renderCameraSelector();
   try { await loadStats(); } catch (error) {}
   try { await loadRoadNetwork(); } catch (error) {}
+  try { await loadTrafficAnalytics(); } catch (error) {}
   try { await loadReviewQueue(); } catch (error) {}
   try { await loadMatchQueue(); } catch (error) {}
+  try { await loadAnomalyQueue(); } catch (error) {}
+  try { await loadPlateSuspicionQueue(); } catch (error) {}
+  try { await loadRouteAnomalyQueue(); } catch (error) {}
   try { await loadVehicles(); } catch (error) {}
   if (selectedPlate) {
     try {
       const data = await fetchJSON(trajectoryUrl(selectedPlate));
       renderMap(data.hops);
-      renderHops(data.hops);
+      if (selectedVehicleId) {
+        try {
+          const history = await fetchJSON(`/api/vehicles/${encodeURIComponent(selectedVehicleId)}/history`);
+          let speedHistory = null;
+          try { speedHistory = await fetchJSON(`/api/vehicles/${encodeURIComponent(selectedVehicleId)}/speed-history`); } catch (error) {}
+          renderVehicleHistory(history, speedHistory);
+          try {
+            const investigation = await fetchJSON(`/api/vehicles/${encodeURIComponent(selectedVehicleId)}/investigation`);
+            renderInvestigation(investigation);
+          } catch (error) {}
+        } catch (error) {
+          renderHops(data.hops, data.trajectory_hops || data.segments || []);
+        }
+      } else {
+        renderHops(data.hops, data.trajectory_hops || data.segments || []);
+      }
     } catch (error) { renderMap([]); renderHops([]); }
   }
   } finally { refreshing = false; }
