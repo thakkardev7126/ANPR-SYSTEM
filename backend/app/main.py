@@ -20,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.database import get_db, PlateEvent, Camera, Base, engine, AsyncPlateEventWriter, VehicleMatchCandidate
+from app.database import get_db, PlateEvent, Camera, Base, engine, AsyncPlateEventWriter, VehicleMatchCandidate, VehicleAnomaly, PlateSuspicionEvent, RouteAnomalyEvent
 from app.database import DATABASE_PATH, DATABASE_URL
 from app.database import SessionLocal, backfill_vehicle_ids, ensure_vehicle_for_event, plate_similarity_score, persist_plate_event
 from app.database import HotlistAlert, HotlistNotification
@@ -46,10 +46,48 @@ from app.anpr_pipeline import (
     fallback_ocr_regions,
 )
 from app.plate_rules import PENDING_REVIEW_STATUS, normalize_plate_text, status_for_plate
-from app.trajectory import build_trajectory, get_vehicle_by_id, get_vehicle_by_plate, haversine_km, list_all_vehicles, vehicle_history, vehicle_payload
+from app.trajectory import (
+    build_plate_complete_trajectory,
+    build_trajectory,
+    build_vehicle_trajectory,
+    get_vehicle_by_id,
+    get_vehicle_by_plate,
+    haversine_km,
+    list_all_vehicles,
+    vehicle_history,
+    vehicle_payload,
+)
 from app.vehicle_appearance import analyze_vehicle_appearance, appearance_similarity, serialize_embedding
 from app.vehicle_matching import match_payload, matches_for_observation, matches_for_vehicle, matching_thresholds, review_match
 from app.travel_time import speed_summary, vehicle_speed_history
+from app.anomalies import anomaly_payload, speed_policy
+from app.plate_suspicion import (
+    plate_suspicion_summary,
+    suspicion_config,
+    suspicion_payload,
+)
+from app.route_anomaly import (
+    route_anomaly_config,
+    route_anomaly_payload,
+    route_anomaly_summary,
+)
+from app.investigation import build_plate_investigation, build_vehicle_investigation
+from app.traffic_analytics import (
+    camera_metrics,
+    congestion_metrics,
+    density_metrics,
+    dwell_metrics,
+    flow_metrics,
+    heatmap_points,
+    lane_metrics,
+    od_matrix,
+    road_metrics,
+    timeseries,
+    traffic_dashboard,
+    traffic_policy,
+    traffic_summary,
+    validate_bucket,
+)
 from app.road_network import (
     create_connection,
     disable_connection,
@@ -1101,6 +1139,9 @@ async def clear_events(db: Session = Depends(get_db)):
     deleted_events = len(events)
     # Keep alert snapshots without references to IDs SQLite may reuse after a clear.
     db.query(HotlistAlert).update({HotlistAlert.event_id: None}, synchronize_session=False)
+    db.query(RouteAnomalyEvent).delete(synchronize_session=False)
+    db.query(PlateSuspicionEvent).delete(synchronize_session=False)
+    db.query(VehicleAnomaly).delete(synchronize_session=False)
     db.query(VehicleMatchCandidate).delete(synchronize_session=False)
     db.query(PlateEvent).delete(synchronize_session=False)
     db.commit()
@@ -1175,6 +1216,311 @@ def get_match_config():
     """Expose the active matching thresholds for operators/tests."""
     return {"matching_model": "vehicle-match-v1", "matching_version": "2B-2026-09-12",
             "thresholds": matching_thresholds()}
+
+
+@app.get("/api/anomaly-policy")
+def get_anomaly_policy(road_type: str | None = Query(None)):
+    """Expose configured speed plausibility thresholds."""
+    return {"anomaly_type": "impossible_travel", "thresholds": speed_policy(road_type)}
+
+
+@app.get("/api/anomalies")
+def get_anomalies(anomaly_type: str | None = Query(None),
+                  severity: str | None = Query(None),
+                  vehicle_id: str | None = Query(None),
+                  plate: str | None = Query(None),
+                  status: str | None = Query(None),
+                  limit: int = Query(100, ge=1, le=500),
+                  db: Session = Depends(get_db)):
+    query = db.query(VehicleAnomaly)
+    if anomaly_type:
+        query = query.filter(VehicleAnomaly.anomaly_type == anomaly_type)
+    if severity:
+        query = query.filter(VehicleAnomaly.severity == severity)
+    if vehicle_id:
+        query = query.filter(VehicleAnomaly.vehicle_id == vehicle_id)
+    if plate:
+        query = query.filter(VehicleAnomaly.plate_text == normalize_plate_text(plate).normalized_text)
+    if status:
+        query = query.filter(VehicleAnomaly.status == status)
+    rows = query.order_by(VehicleAnomaly.detected_at.desc(), VehicleAnomaly.id.desc()).limit(limit).all()
+    return {"items": [anomaly_payload(row) for row in rows], "total": len(rows)}
+
+
+@app.get("/api/plate-suspicion-policy")
+def get_plate_suspicion_policy():
+    return suspicion_config()
+
+
+@app.get("/api/plate-suspicions")
+def get_plate_suspicions(plate: str | None = Query(None),
+                         classification: str | None = Query(None),
+                         status: str | None = Query(None),
+                         vehicle_id: str | None = Query(None),
+                         limit: int = Query(100, ge=1, le=500),
+                         db: Session = Depends(get_db)):
+    query = db.query(PlateSuspicionEvent)
+    if plate:
+        normalized = normalize_plate_text(plate).normalized_text
+        if normalized:
+            plate_suspicion_summary(db, normalized, persist=True)
+            db.commit()
+            query = query.filter(PlateSuspicionEvent.plate_text == normalized)
+        else:
+            query = query.filter(PlateSuspicionEvent.plate_text == "__invalid__")
+    if classification:
+        query = query.filter(PlateSuspicionEvent.classification == classification)
+    if status:
+        query = query.filter(PlateSuspicionEvent.status == status)
+    if vehicle_id:
+        query = query.filter(PlateSuspicionEvent.vehicle_id == vehicle_id)
+    rows = (
+        query.order_by(PlateSuspicionEvent.suspicion_score.desc(), PlateSuspicionEvent.updated_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return {"items": [suspicion_payload(row) for row in rows], "total": len(rows)}
+
+
+@app.get("/api/plates/{plate_text}/suspicion")
+def get_plate_suspicion(plate_text: str, db: Session = Depends(get_db)):
+    summary = plate_suspicion_summary(db, plate_text, persist=True)
+    db.commit()
+    return summary
+
+
+@app.patch("/api/plate-suspicions/{suspicion_id}/review")
+def review_plate_suspicion(suspicion_id: int, payload: dict, db: Session = Depends(get_db)):
+    row = db.get(PlateSuspicionEvent, suspicion_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Plate suspicion not found")
+    status = str(payload.get("status", "")).strip().lower()
+    if status not in {"open", "acknowledged", "dismissed"}:
+        raise HTTPException(status_code=400, detail="status must be open, acknowledged, or dismissed")
+    row.status = status
+    row.reviewed_by = payload.get("reviewed_by") or row.reviewed_by
+    row.reviewed_at = datetime.datetime.utcnow() if status in {"acknowledged", "dismissed"} else None
+    row.updated_at = datetime.datetime.utcnow()
+    db.commit()
+    db.refresh(row)
+    return suspicion_payload(row)
+
+
+@app.get("/api/route-anomaly-policy")
+def get_route_anomaly_policy():
+    return route_anomaly_config()
+
+
+def validate_traffic_filters(db, start, end, minutes, bucket="hour",
+                             camera_id=None, source_camera_id=None, destination_camera_id=None):
+    start, end = validate_search_filters(start, end, minutes, None, None)
+    try:
+        bucket = validate_bucket(bucket)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    for value, label in ((camera_id, "camera_id"), (source_camera_id, "source_camera_id"),
+                         (destination_camera_id, "destination_camera_id")):
+        if value and not db.get(Camera, value):
+            raise HTTPException(status_code=404, detail=f"Unknown {label}")
+    return start, end, bucket
+
+
+@app.get("/api/traffic/policy")
+def get_traffic_policy():
+    return traffic_policy()
+
+
+@app.get("/api/traffic/summary")
+def get_traffic_summary(start: datetime.datetime | None = Query(None),
+                        end: datetime.datetime | None = Query(None),
+                        minutes: int | None = Query(None, ge=1),
+                        db: Session = Depends(get_db)):
+    start, end, _bucket = validate_traffic_filters(db, start, end, minutes)
+    return traffic_summary(db, start=start, end=end)
+
+
+@app.get("/api/traffic/cameras")
+def get_traffic_cameras(start: datetime.datetime | None = Query(None),
+                        end: datetime.datetime | None = Query(None),
+                        minutes: int | None = Query(None, ge=1),
+                        camera_id: str | None = Query(None),
+                        db: Session = Depends(get_db)):
+    start, end, _bucket = validate_traffic_filters(db, start, end, minutes, camera_id=camera_id)
+    return {"items": camera_metrics(db, start=start, end=end, camera_id=camera_id), "metric_basis": "camera_observations"}
+
+
+@app.get("/api/traffic/flow")
+def get_traffic_flow(start: datetime.datetime | None = Query(None),
+                     end: datetime.datetime | None = Query(None),
+                     minutes: int | None = Query(None, ge=1),
+                     source_camera_id: str | None = Query(None),
+                     destination_camera_id: str | None = Query(None),
+                     db: Session = Depends(get_db)):
+    start, end, _bucket = validate_traffic_filters(db, start, end, minutes,
+                                                   source_camera_id=source_camera_id,
+                                                   destination_camera_id=destination_camera_id)
+    return {"items": flow_metrics(db, start=start, end=end, source_camera_id=source_camera_id,
+                                  destination_camera_id=destination_camera_id),
+            "metric_basis": "direct_consecutive_global_vehicle_transitions"}
+
+
+@app.get("/api/traffic/od-matrix")
+def get_traffic_od_matrix(start: datetime.datetime | None = Query(None),
+                          end: datetime.datetime | None = Query(None),
+                          minutes: int | None = Query(None, ge=1),
+                          bucket: str = Query("hour"),
+                          source_camera_id: str | None = Query(None),
+                          destination_camera_id: str | None = Query(None),
+                          db: Session = Depends(get_db)):
+    start, end, bucket = validate_traffic_filters(db, start, end, minutes, bucket=bucket,
+                                                  source_camera_id=source_camera_id,
+                                                  destination_camera_id=destination_camera_id)
+    return {"items": od_matrix(db, start=start, end=end, bucket=bucket,
+                               source_camera_id=source_camera_id,
+                               destination_camera_id=destination_camera_id),
+            "bucket": bucket,
+            "metric_basis": "direct_consecutive_global_vehicle_transitions"}
+
+
+@app.get("/api/traffic/density")
+def get_traffic_density(start: datetime.datetime | None = Query(None),
+                        end: datetime.datetime | None = Query(None),
+                        minutes: int | None = Query(None, ge=1),
+                        camera_id: str | None = Query(None),
+                        db: Session = Depends(get_db)):
+    start, end, _bucket = validate_traffic_filters(db, start, end, minutes, camera_id=camera_id)
+    return {"items": density_metrics(db, start=start, end=end, camera_id=camera_id),
+            "metric_basis": "camera_observation_density"}
+
+
+@app.get("/api/traffic/congestion")
+def get_traffic_congestion(start: datetime.datetime | None = Query(None),
+                           end: datetime.datetime | None = Query(None),
+                           minutes: int | None = Query(None, ge=1),
+                           source_camera_id: str | None = Query(None),
+                           destination_camera_id: str | None = Query(None),
+                           db: Session = Depends(get_db)):
+    start, end, _bucket = validate_traffic_filters(db, start, end, minutes,
+                                                   source_camera_id=source_camera_id,
+                                                   destination_camera_id=destination_camera_id)
+    return {"items": congestion_metrics(db, start=start, end=end, source_camera_id=source_camera_id,
+                                        destination_camera_id=destination_camera_id),
+            "metric_basis": "estimated_camera_to_camera_average_speed_and_volume"}
+
+
+@app.get("/api/traffic/dwell")
+def get_traffic_dwell(start: datetime.datetime | None = Query(None),
+                      end: datetime.datetime | None = Query(None),
+                      minutes: int | None = Query(None, ge=1),
+                      camera_id: str | None = Query(None),
+                      bucket: str = Query("hour"),
+                      db: Session = Depends(get_db)):
+    start, end, bucket = validate_traffic_filters(db, start, end, minutes, bucket=bucket, camera_id=camera_id)
+    return {"items": dwell_metrics(db, start=start, end=end, camera_id=camera_id, bucket=bucket),
+            "bucket": bucket,
+            "metric_basis": "camera_observation_dwell_estimate"}
+
+
+@app.get("/api/traffic/roads")
+def get_traffic_roads(start: datetime.datetime | None = Query(None),
+                      end: datetime.datetime | None = Query(None),
+                      minutes: int | None = Query(None, ge=1),
+                      source_camera_id: str | None = Query(None),
+                      destination_camera_id: str | None = Query(None),
+                      db: Session = Depends(get_db)):
+    start, end, _bucket = validate_traffic_filters(db, start, end, minutes,
+                                                   source_camera_id=source_camera_id,
+                                                   destination_camera_id=destination_camera_id)
+    return {"items": road_metrics(db, start=start, end=end, source_camera_id=source_camera_id,
+                                  destination_camera_id=destination_camera_id),
+            "metric_basis": "configured_road_connections"}
+
+
+@app.get("/api/traffic/heatmap")
+def get_traffic_heatmap(start: datetime.datetime | None = Query(None),
+                        end: datetime.datetime | None = Query(None),
+                        minutes: int | None = Query(None, ge=1),
+                        db: Session = Depends(get_db)):
+    start, end, _bucket = validate_traffic_filters(db, start, end, minutes)
+    return {"points": heatmap_points(db, start=start, end=end), "metric_basis": "camera_observation_activity"}
+
+
+@app.get("/api/traffic/timeseries")
+def get_traffic_timeseries(start: datetime.datetime | None = Query(None),
+                           end: datetime.datetime | None = Query(None),
+                           minutes: int | None = Query(None, ge=1),
+                           camera_id: str | None = Query(None),
+                           bucket: str = Query("hour"),
+                           db: Session = Depends(get_db)):
+    start, end, bucket = validate_traffic_filters(db, start, end, minutes, bucket=bucket, camera_id=camera_id)
+    return {"items": timeseries(db, start=start, end=end, camera_id=camera_id, bucket=bucket), "bucket": bucket}
+
+
+@app.get("/api/traffic/lanes")
+def get_traffic_lanes():
+    return lane_metrics()
+
+
+@app.get("/api/traffic/dashboard")
+def get_traffic_dashboard(start: datetime.datetime | None = Query(None),
+                          end: datetime.datetime | None = Query(None),
+                          minutes: int | None = Query(None, ge=1),
+                          bucket: str = Query("hour"),
+                          db: Session = Depends(get_db)):
+    start, end, bucket = validate_traffic_filters(db, start, end, minutes, bucket=bucket)
+    return traffic_dashboard(db, start=start, end=end, bucket=bucket)
+
+
+@app.get("/api/route-anomalies")
+def get_route_anomalies(vehicle_id: str | None = Query(None),
+                        plate: str | None = Query(None),
+                        classification: str | None = Query(None),
+                        status: str | None = Query(None),
+                        limit: int = Query(100, ge=1, le=500),
+                        db: Session = Depends(get_db)):
+    query = db.query(RouteAnomalyEvent)
+    if vehicle_id:
+        query = query.filter(RouteAnomalyEvent.vehicle_id == vehicle_id)
+    if plate:
+        normalized = normalize_plate_text(plate).normalized_text
+        query = query.filter(RouteAnomalyEvent.plate_text == normalized) if normalized else query.filter(RouteAnomalyEvent.plate_text == "__invalid__")
+    if classification:
+        query = query.filter(RouteAnomalyEvent.classification == classification)
+    if status:
+        query = query.filter(RouteAnomalyEvent.status == status)
+    rows = (
+        query.order_by(RouteAnomalyEvent.route_anomaly_score.desc(), RouteAnomalyEvent.updated_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return {"items": [route_anomaly_payload(row) for row in rows], "total": len(rows)}
+
+
+@app.get("/api/vehicles/{vehicle_id}/route-anomalies")
+def get_vehicle_route_anomalies(vehicle_id: str, db: Session = Depends(get_db)):
+    vehicle = get_vehicle_by_id(db, vehicle_id)
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    summary = route_anomaly_summary(db, vehicle_id, persist=True)
+    db.commit()
+    return summary
+
+
+@app.patch("/api/route-anomalies/{route_anomaly_id}/review")
+def review_route_anomaly(route_anomaly_id: int, payload: dict, db: Session = Depends(get_db)):
+    row = db.get(RouteAnomalyEvent, route_anomaly_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Route anomaly not found")
+    status = str(payload.get("status", "")).strip().lower()
+    if status not in {"open", "acknowledged", "dismissed"}:
+        raise HTTPException(status_code=400, detail="status must be open, acknowledged, or dismissed")
+    row.status = status
+    row.reviewed_by = payload.get("reviewed_by") or row.reviewed_by
+    row.reviewed_at = datetime.datetime.utcnow() if status in {"acknowledged", "dismissed"} else None
+    row.updated_at = datetime.datetime.utcnow()
+    db.commit()
+    db.refresh(row)
+    return route_anomaly_payload(row)
 
 
 @app.get("/api/matches/review")
@@ -1270,7 +1616,48 @@ def get_vehicle_history(vehicle_id: str, db: Session = Depends(get_db)):
     history = vehicle_history(db, vehicle_id)
     if not history:
         raise HTTPException(status_code=404, detail="Vehicle not found")
+    if history.get("primary_plate_text"):
+        history["plate_suspicion"] = plate_suspicion_summary(db, history["primary_plate_text"], persist=True)
+    history["route_anomaly"] = route_anomaly_summary(db, vehicle_id, persist=True)
+    db.commit()
     return history
+
+
+@app.get("/api/vehicles/{vehicle_id}/investigation")
+def get_vehicle_investigation(vehicle_id: str, db: Session = Depends(get_db)):
+    """Unified explainable investigation view for one Global Vehicle ID."""
+    investigation = build_vehicle_investigation(db, vehicle_id)
+    if not investigation:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    db.commit()
+    return investigation
+
+
+@app.get("/api/plates/{plate_text}/investigation")
+def get_plate_investigation(plate_text: str, db: Session = Depends(get_db)):
+    """Open an investigation by confirmed valid plate text."""
+    investigation = build_plate_investigation(db, plate_text)
+    if not investigation:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    db.commit()
+    return investigation
+
+
+@app.get("/api/vehicles/{vehicle_id}/trajectory")
+def get_vehicle_trajectory(vehicle_id: str, start: datetime.datetime | None = Query(None),
+                           end: datetime.datetime | None = Query(None),
+                           minutes: int | None = Query(None, ge=1),
+                           db: Session = Depends(get_db)):
+    """Complete chronological multi-camera trajectory for one Global Vehicle ID."""
+    start, end = validate_search_filters(start, end, minutes, None, None)
+    trajectory = build_vehicle_trajectory(db, vehicle_id, start=start, end=end)
+    if not trajectory:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    if trajectory.get("plate_text"):
+        trajectory["plate_suspicion"] = plate_suspicion_summary(db, trajectory["plate_text"], persist=True)
+    trajectory["route_anomaly"] = route_anomaly_summary(db, vehicle_id, persist=True)
+    db.commit()
+    return trajectory
 
 
 @app.get("/api/vehicles/{vehicle_id}/observations")
@@ -1295,6 +1682,21 @@ def get_vehicle_speed_history(vehicle_id: str, db: Session = Depends(get_db)):
     return history
 
 
+@app.get("/api/vehicles/{vehicle_id}/anomalies")
+def get_vehicle_anomalies(vehicle_id: str, status: str | None = Query(None),
+                          limit: int = Query(100, ge=1, le=500),
+                          db: Session = Depends(get_db)):
+    vehicle = get_vehicle_by_id(db, vehicle_id)
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    query = db.query(VehicleAnomaly).filter(VehicleAnomaly.vehicle_id == vehicle_id)
+    if status:
+        query = query.filter(VehicleAnomaly.status == status)
+    rows = query.order_by(VehicleAnomaly.detected_at.desc(), VehicleAnomaly.id.desc()).limit(limit).all()
+    return {"global_vehicle_id": vehicle_id, "vehicle_id": vehicle_id,
+            "items": [anomaly_payload(row) for row in rows], "total": len(rows)}
+
+
 @app.get("/api/vehicles/{vehicle_id}/matches")
 def get_vehicle_matches(vehicle_id: str, db: Session = Depends(get_db)):
     vehicle = get_vehicle_by_id(db, vehicle_id)
@@ -1315,7 +1717,27 @@ def get_trajectory(plate_text: str, start: datetime.datetime | None = None,
     if not hops:
         raise HTTPException(status_code=404, detail="No sightings for this plate")
     segments = [hop for hop in hops[1:]]
-    return {"plate_text": plate_text.upper().strip(), "hops": hops, "speed_summary": speed_summary(segments)}
+    plate_suspicion = plate_suspicion_summary(db, plate_text.upper().strip(), persist=True)
+    complete = build_plate_complete_trajectory(db, plate_text.upper().strip(), start=start, end=end,
+                                               lat=lat, lng=lng, radius_m=radius_m)
+    route_anomaly = route_anomaly_summary(db, complete["vehicle_id"], persist=True) if complete.get("vehicle_id") else None
+    complete = build_plate_complete_trajectory(db, plate_text.upper().strip(), start=start, end=end,
+                                               lat=lat, lng=lng, radius_m=radius_m)
+    db.commit()
+    return {
+        "plate_text": plate_text.upper().strip(),
+        "hops": hops,
+        "speed_summary": speed_summary(segments),
+        "plate_suspicion": plate_suspicion,
+        "route_anomaly": route_anomaly,
+        "vehicle": complete["vehicle"],
+        "global_vehicle_id": complete["global_vehicle_id"],
+        "vehicle_id": complete["vehicle_id"],
+        "observations": complete["observations"],
+        "trajectory_hops": complete["trajectory_hops"],
+        "segments": complete["segments"],
+        "summary": complete["summary"],
+    }
 
 
 def validate_search_filters(start, end, minutes, lat, lng):

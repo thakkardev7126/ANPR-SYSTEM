@@ -26,11 +26,12 @@ from app import anpr_pipeline as pipeline
 from app.plate_rules import normalize_plate_text, strip_hsrp_noise
 from app.image_quality import padded_plate_crop, normalize_size, assess_quality, enhanced_variants, PartialPlateHistory
 from app.location import resolve_location
-from app.database import SessionLocal, PlateEvent, Camera, CameraRoadConnection, Vehicle, VehicleMatchCandidate, persist_plate_event, engine, HotlistEntry, HotlistAlert, HotlistNotification
+from app.database import SessionLocal, PlateEvent, Camera, CameraRoadConnection, Vehicle, VehicleMatchCandidate, VehicleAnomaly, PlateSuspicionEvent, RouteAnomalyEvent, persist_plate_event, engine, HotlistEntry, HotlistAlert, HotlistNotification
 from app.main import app
 from app.seed_cameras import seed
 from app.road_network import camera_transition
 from app.travel_time import calculate_travel_segment, vehicle_speed_history
+from app.trajectory import build_vehicle_trajectory
 from app.vehicle_appearance import (
     analyze_vehicle_appearance,
     appearance_similarity,
@@ -318,6 +319,9 @@ class APITests(unittest.TestCase):
             db.query(HotlistNotification).delete()
             db.query(HotlistAlert).delete()
             db.query(HotlistEntry).delete()
+            db.query(RouteAnomalyEvent).delete()
+            db.query(PlateSuspicionEvent).delete()
+            db.query(VehicleAnomaly).delete()
             db.query(VehicleMatchCandidate).delete()
             db.query(PlateEvent).delete()
             db.query(Vehicle).delete()
@@ -570,6 +574,760 @@ class APITests(unittest.TestCase):
         persist_plate_event(dict(camera_id="CAM03",plate_text="D",confidence=.99,status="ok"))
         with SessionLocal() as db:
             self.assertEqual(db.query(Vehicle).count(), 1)
+
+    def test_complete_multi_camera_trajectory_summary_and_hops(self):
+        self.client.post("/api/camera-road-connections", json={
+            "source_camera_id":"CAM01","destination_camera_id":"CAM02","distance_meters":4200,
+            "direction":"NE",
+        })
+        self.client.post("/api/camera-road-connections", json={
+            "source_camera_id":"CAM02","destination_camera_id":"CAM03","distance_meters":3800,
+            "direction":"E",
+        })
+        events = [
+            persist_plate_event(dict(camera_id="CAM01",plate_text="GJ01AB1234",confidence=.95,status="ok"))[0],
+            persist_plate_event(dict(camera_id="CAM02",plate_text="GJ01AB1234",confidence=.95,status="ok"))[0],
+            persist_plate_event(dict(camera_id="CAM03",plate_text="GJ01AB1234",confidence=.95,status="ok"))[0],
+            persist_plate_event(dict(camera_id="CAM04",plate_text="GJ01AB1234",confidence=.95,status="ok"))[0],
+        ]
+        stamps = [
+            dt.datetime(2026, 9, 13, 10, 0, 0),
+            dt.datetime(2026, 9, 13, 10, 6, 18),
+            dt.datetime(2026, 9, 13, 10, 12, 0),
+            dt.datetime(2026, 9, 13, 10, 20, 0),
+        ]
+        with SessionLocal() as db:
+            for event, stamp in zip(events, stamps):
+                db.get(PlateEvent, event.id).timestamp = stamp
+            db.commit()
+        route = self.client.get("/api/trajectory/GJ01AB1234").json()
+        self.assertEqual([item["camera_id"] for item in route["observations"]],
+                         ["CAM01","CAM02","CAM03","CAM04"])
+        self.assertEqual(len(route["trajectory_hops"]), 3)
+        first, second, third = route["trajectory_hops"]
+        self.assertEqual(first["source_camera_id"], "CAM01")
+        self.assertEqual(first["destination_camera_id"], "CAM02")
+        self.assertEqual(first["distance_meters"], 4200)
+        self.assertEqual(first["travel_time_seconds"], 378)
+        self.assertAlmostEqual(first["estimated_speed_kmh"], 40.0, places=2)
+        self.assertEqual(first["continuity"], "connected")
+        self.assertEqual(second["distance_meters"], 3800)
+        self.assertEqual(second["travel_time_seconds"], 342)
+        self.assertAlmostEqual(second["estimated_speed_kmh"], 40.0, places=2)
+        self.assertEqual(second["continuity"], "connected")
+        self.assertEqual(third["continuity"], "not_connected")
+        self.assertEqual(third["speed_status"], "missing_road_connection")
+        self.assertFalse(third["speed_available"])
+        self.assertIsNone(third["distance_meters"])
+        summary = route["summary"]
+        self.assertEqual(summary["total_observations"], 4)
+        self.assertEqual(summary["valid_segments"], 2)
+        self.assertEqual(summary["unavailable_segments"], 1)
+        self.assertEqual(summary["total_road_distance_meters"], 8000)
+        self.assertEqual(summary["total_travel_time_seconds"], 720)
+        self.assertAlmostEqual(summary["average_estimated_speed_kmh"], 40.0, places=2)
+
+    def test_vehicle_trajectory_endpoint_and_history_compatibility(self):
+        self.client.post("/api/camera-road-connections", json={
+            "source_camera_id":"CAM01","destination_camera_id":"CAM02","distance_meters":4200,
+        })
+        first = persist_plate_event(dict(camera_id="CAM01",plate_text="GJ01AB1234",confidence=.95,status="ok"))[0]
+        second = persist_plate_event(dict(camera_id="CAM02",plate_text="GJ01AB1234",confidence=.95,status="ok"))[0]
+        with SessionLocal() as db:
+            db.get(PlateEvent, first.id).timestamp = dt.datetime(2026, 9, 13, 10, 0, 0)
+            db.get(PlateEvent, second.id).timestamp = dt.datetime(2026, 9, 13, 10, 6, 18)
+            db.commit()
+        history = self.client.get(f"/api/vehicles/{first.vehicle_id}/history").json()
+        trajectory = self.client.get(f"/api/vehicles/{first.vehicle_id}/trajectory").json()
+        self.assertEqual([item["event_id"] for item in history["observations"]],
+                         [item["event_id"] for item in trajectory["observations"]])
+        self.assertEqual(history["summary"]["valid_segments"], 1)
+        self.assertEqual(trajectory["summary"]["valid_segments"], 1)
+        self.assertEqual(trajectory["vehicle"]["global_vehicle_id"], first.vehicle_id)
+
+    def test_trajectory_orders_out_of_order_insertion_and_same_timestamp(self):
+        events = [
+            persist_plate_event(dict(camera_id="CAM03",plate_text="GJ01AB1234",confidence=.95,status="ok"))[0],
+            persist_plate_event(dict(camera_id="CAM01",plate_text="GJ01AB1234",confidence=.95,status="ok"))[0],
+            persist_plate_event(dict(camera_id="CAM02",plate_text="GJ01AB1234",confidence=.95,status="ok"))[0],
+        ]
+        same = dt.datetime(2026, 9, 13, 10, 0, 0)
+        with SessionLocal() as db:
+            db.get(PlateEvent, events[0].id).timestamp = dt.datetime(2026, 9, 13, 10, 10, 0)
+            db.get(PlateEvent, events[1].id).timestamp = same
+            db.get(PlateEvent, events[2].id).timestamp = same
+            db.commit()
+        route = self.client.get("/api/trajectory/GJ01AB1234").json()
+        self.assertEqual([item["camera_id"] for item in route["observations"]],
+                         ["CAM01","CAM02","CAM03"])
+        self.assertEqual(route["trajectory_hops"][0]["continuity"], "invalid_time")
+
+    def test_complete_trajectory_single_missing_unknown_and_inactive_cases(self):
+        single = persist_plate_event(dict(camera_id="CAM01",plate_text="GJ01AB1234",confidence=.95,status="ok"))[0]
+        route = self.client.get("/api/trajectory/GJ01AB1234").json()
+        self.assertEqual(route["summary"]["total_observations"], 1)
+        self.assertEqual(route["trajectory_hops"], [])
+
+        unknown = persist_plate_event(dict(camera_id="CAMXX",plate_text="GJ01AB1234",confidence=.95,status="ok"))[0]
+        with SessionLocal() as db:
+            db.get(PlateEvent, single.id).timestamp = dt.datetime(2026, 9, 13, 10, 0, 0)
+            db.get(PlateEvent, unknown.id).timestamp = dt.datetime(2026, 9, 13, 10, 5, 0)
+            db.commit()
+        route = self.client.get("/api/trajectory/GJ01AB1234").json()
+        self.assertEqual(route["trajectory_hops"][0]["continuity"], "invalid_observation")
+
+        with SessionLocal() as db:
+            db.get(PlateEvent, unknown.id).camera_id = "CAM02"
+            db.get(PlateEvent, unknown.id).timestamp = None
+            db.commit()
+        route = self.client.get(f"/api/vehicles/{single.vehicle_id}/trajectory").json()
+        self.assertEqual(route["trajectory_hops"][0]["continuity"], "invalid_time")
+
+        with SessionLocal() as db:
+            db.get(PlateEvent, unknown.id).timestamp = dt.datetime(2026, 9, 13, 10, 5, 0)
+            db.add(CameraRoadConnection(source_camera_id="CAM01", destination_camera_id="CAM02",
+                                        distance_meters=4200, active=False,
+                                        created_at=dt.datetime.utcnow(), updated_at=dt.datetime.utcnow()))
+            db.commit()
+        route = self.client.get("/api/trajectory/GJ01AB1234").json()
+        self.assertEqual(route["trajectory_hops"][0]["continuity"], "not_connected")
+
+    def test_complete_trajectory_missing_road_distance_and_invalid_time(self):
+        self.client.post("/api/camera-road-connections", json={
+            "source_camera_id":"CAM01","destination_camera_id":"CAM02","distance_meters":4200,
+        })
+        first = persist_plate_event(dict(camera_id="CAM01",plate_text="GJ01AB1234",confidence=.95,status="ok"))[0]
+        second = persist_plate_event(dict(camera_id="CAM02",plate_text="GJ01AB1234",confidence=.95,status="ok"))[0]
+        with SessionLocal() as db:
+            db.get(PlateEvent, first.id).timestamp = dt.datetime(2026, 9, 13, 10, 0, 0)
+            db.get(PlateEvent, second.id).timestamp = dt.datetime(2026, 9, 13, 10, 0, 0)
+            db.commit()
+        route = self.client.get("/api/trajectory/GJ01AB1234").json()
+        self.assertEqual(route["trajectory_hops"][0]["continuity"], "invalid_time")
+
+        with SessionLocal() as db:
+            db.get(PlateEvent, first.id).timestamp = dt.datetime(2026, 9, 13, 10, 0, 0)
+            db.get(PlateEvent, second.id).timestamp = dt.datetime(2026, 9, 13, 10, 5, 0)
+            connection = db.query(CameraRoadConnection).one()
+            connection.distance_meters = None
+            with db.no_autoflush:
+                route = build_vehicle_trajectory(db, first.vehicle_id)
+        self.assertEqual(route["trajectory_hops"][0]["speed_status"], "invalid_distance")
+        self.assertEqual(route["trajectory_hops"][0]["continuity"], "invalid_observation")
+
+    def test_trajectory_preserves_matching_evidence_and_invalid_ocr_rules(self):
+        self.client.post("/api/camera-road-connections", json={
+            "source_camera_id":"CAM01","destination_camera_id":"CAM02","distance_meters":4200,
+        })
+        first = persist_plate_event(dict(camera_id="CAM01",plate_text="GJ01AB1234",
+                                         confidence=.95,status="ok", **appearance_values()))[0]
+        second = persist_plate_event(dict(camera_id="CAM02",plate_text="GJ01AB1234",
+                                          confidence=.95,status="ok", **appearance_values()))[0]
+        with SessionLocal() as db:
+            db.get(PlateEvent, first.id).timestamp = dt.datetime(2026, 9, 13, 10, 0, 0)
+            db.get(PlateEvent, second.id).timestamp = dt.datetime(2026, 9, 13, 10, 6, 18)
+            db.commit()
+        route = self.client.get("/api/trajectory/GJ01AB1234").json()
+        evidence = route["trajectory_hops"][0]["matching_evidence"]
+        self.assertIsNotNone(evidence)
+        self.assertEqual(evidence["decision"], "confirmed_existing")
+        self.assertGreaterEqual(evidence["confidence"], .88)
+
+        persist_plate_event(dict(camera_id="CAM03", plate_text="D", confidence=.99, status="ok",
+                                 **appearance_values()))
+        with SessionLocal() as db:
+            self.assertEqual(db.query(Vehicle).count(), 1)
+
+    def _fixed_pair(self, seconds):
+        first = persist_plate_event(dict(camera_id="CAM01",plate_text="GJ01AB1234",confidence=.95,status="ok"))[0]
+        second = persist_plate_event(dict(camera_id="CAM02",plate_text="GJ01AB1234",confidence=.95,status="ok"))[0]
+        start = dt.datetime(2026, 9, 13, 10, 0, 0)
+        with SessionLocal() as db:
+            db.get(PlateEvent, first.id).timestamp = start
+            db.get(PlateEvent, second.id).timestamp = start + dt.timedelta(seconds=seconds)
+            db.commit()
+        return first, second
+
+    def _clear_road_connections(self):
+        with SessionLocal() as db:
+            db.query(CameraRoadConnection).delete()
+            db.commit()
+
+    def test_impossible_travel_policy_normal_warning_and_impossible(self):
+        self._fixed_pair(378)
+        self.client.post("/api/camera-road-connections", json={
+            "source_camera_id":"CAM01","destination_camera_id":"CAM02","distance_meters":4200,
+            "road_type":"arterial",
+        })
+        normal = self.client.get("/api/trajectory/GJ01AB1234").json()["trajectory_hops"][0]
+        self.assertEqual(normal["anomaly_status"], "normal")
+        self.assertEqual(self.client.get("/api/anomalies").json()["total"], 0)
+
+        self.client.delete("/api/events")
+        self._clear_road_connections()
+        first, _ = self._fixed_pair(151.2)
+        self.client.post("/api/camera-road-connections", json={
+            "source_camera_id":"CAM01","destination_camera_id":"CAM02","distance_meters":4200,
+        })
+        warning = self.client.get("/api/trajectory/GJ01AB1234").json()["trajectory_hops"][0]
+        self.assertEqual(warning["anomaly_status"], "warning")
+        self.assertEqual(warning["anomaly_severity"], "warning")
+        self.assertAlmostEqual(warning["estimated_speed_kmh"], 100.0, places=1)
+        self.assertEqual(self.client.get(f"/api/vehicles/{first.vehicle_id}/anomalies").json()["total"], 1)
+
+        self.client.delete("/api/events")
+        self._clear_road_connections()
+        self._fixed_pair(60)
+        self.client.post("/api/camera-road-connections", json={
+            "source_camera_id":"CAM01","destination_camera_id":"CAM02","distance_meters":4200,
+            "road_name":"Demo corridor",
+        })
+        impossible = self.client.get("/api/trajectory/GJ01AB1234").json()["trajectory_hops"][0]
+        self.assertEqual(impossible["anomaly_status"], "impossible_travel")
+        evidence = impossible["anomaly_evidence"]
+        self.assertEqual(evidence["severity"], "critical")
+        self.assertAlmostEqual(evidence["estimated_speed_kmh"], 252.0, places=1)
+        self.assertEqual(evidence["allowed_speed_kmh"], 160.0)
+        self.assertAlmostEqual(evidence["excess_ratio"], 1.575, places=3)
+        self.assertIn("252.0 km/h", evidence["explanation"])
+        anomalies = self.client.get("/api/anomalies", params={"anomaly_type":"impossible_travel"}).json()
+        self.assertEqual(anomalies["total"], 1)
+        self.assertEqual(anomalies["items"][0]["severity"], "critical")
+        self.assertIn("252.0 km/h", anomalies["items"][0]["explanation"])
+
+    def test_impossible_travel_ignores_unavailable_or_invalid_segments(self):
+        self._fixed_pair(60)
+        route = self.client.get("/api/trajectory/GJ01AB1234").json()
+        self.assertEqual(route["trajectory_hops"][0]["anomaly_status"], "unavailable")
+        self.assertEqual(self.client.get("/api/anomalies").json()["total"], 0)
+
+        self.client.delete("/api/events")
+        self._clear_road_connections()
+        self._fixed_pair(60)
+        created = self.client.post("/api/camera-road-connections", json={
+            "source_camera_id":"CAM01","destination_camera_id":"CAM02","distance_meters":4200,
+        }).json()
+        self.client.delete(f"/api/camera-road-connections/{created['id']}")
+        route = self.client.get("/api/trajectory/GJ01AB1234").json()
+        self.assertEqual(route["trajectory_hops"][0]["anomaly_status"], "unavailable")
+        self.assertEqual(self.client.get("/api/anomalies").json()["total"], 0)
+
+        self.client.delete("/api/events")
+        self._clear_road_connections()
+        self._fixed_pair(0)
+        self.client.post("/api/camera-road-connections", json={
+            "source_camera_id":"CAM01","destination_camera_id":"CAM02","distance_meters":4200,
+        })
+        route = self.client.get("/api/trajectory/GJ01AB1234").json()
+        self.assertEqual(route["trajectory_hops"][0]["speed_status"], "invalid_time")
+        self.assertEqual(route["trajectory_hops"][0]["anomaly_status"], "unavailable")
+        self.assertEqual(self.client.get("/api/anomalies").json()["total"], 0)
+
+        self.client.delete("/api/events")
+        self._clear_road_connections()
+        first, second = self._fixed_pair(60)
+        self.client.post("/api/camera-road-connections", json={
+            "source_camera_id":"CAM01","destination_camera_id":"CAM02","distance_meters":4200,
+        })
+        with SessionLocal() as db:
+            connection = db.query(CameraRoadConnection).one()
+            connection.distance_meters = None
+            with db.no_autoflush:
+                route = build_vehicle_trajectory(db, first.vehicle_id)
+        self.assertEqual(route["trajectory_hops"][0]["speed_status"], "invalid_distance")
+        self.assertEqual(route["trajectory_hops"][0]["anomaly_status"], "unavailable")
+        with SessionLocal() as db:
+            self.assertEqual(db.query(VehicleAnomaly).count(), 0)
+
+    def test_impossible_travel_duplicate_prevention_and_identity_safety(self):
+        first, second = self._fixed_pair(60)
+        vehicle_id = first.vehicle_id
+        self.client.post("/api/camera-road-connections", json={
+            "source_camera_id":"CAM01","destination_camera_id":"CAM02","distance_meters":4200,
+        })
+        self.client.get("/api/trajectory/GJ01AB1234")
+        self.client.get("/api/trajectory/GJ01AB1234")
+        anomalies = self.client.get("/api/anomalies").json()
+        self.assertEqual(anomalies["total"], 1)
+        with SessionLocal() as db:
+            self.assertEqual(db.get(PlateEvent, first.id).vehicle_id, vehicle_id)
+            self.assertEqual(db.get(PlateEvent, second.id).vehicle_id, vehicle_id)
+        persist_plate_event(dict(camera_id="CAM03", plate_text="D", confidence=.99, status="ok"))
+        with SessionLocal() as db:
+            self.assertEqual(db.query(Vehicle).count(), 1)
+
+    def _valid_event(self, camera_id="CAM01", plate_text="GJ01AB1234", **extra):
+        values = dict(camera_id=camera_id, plate_text=plate_text, confidence=.95, status="ok")
+        values.update(extra)
+        return persist_plate_event(values)[0]
+
+    def _set_timestamps(self, pairs):
+        with SessionLocal() as db:
+            for event, timestamp in pairs:
+                db.get(PlateEvent, event.id).timestamp = timestamp
+            db.commit()
+
+    def _test_embedding(self, values):
+        return serialize_embedding(values)
+
+    def test_cloned_plate_normal_plate_remains_normal(self):
+        first = self._valid_event("CAM01")
+        second = self._valid_event("CAM02")
+        self._set_timestamps([
+            (first, dt.datetime(2026, 9, 13, 10, 0, 0)),
+            (second, dt.datetime(2026, 9, 13, 10, 6, 18)),
+        ])
+        self.client.post("/api/camera-road-connections", json={
+            "source_camera_id":"CAM01","destination_camera_id":"CAM02","distance_meters":4200,
+        })
+        summary = self.client.get("/api/plates/GJ01AB1234/suspicion").json()
+        self.assertEqual(summary["classification"], "normal")
+        self.assertEqual(summary["total"], 0)
+        self.assertFalse(any(item["type"] == "impossible_travel" for item in summary["evaluated_evidence"]))
+
+    def test_cloned_plate_reuses_impossible_travel_evidence(self):
+        first = self._valid_event("CAM01")
+        second = self._valid_event("CAM02")
+        self._set_timestamps([
+            (first, dt.datetime(2026, 9, 13, 10, 0, 0)),
+            (second, dt.datetime(2026, 9, 13, 10, 1, 0)),
+        ])
+        self.client.post("/api/camera-road-connections", json={
+            "source_camera_id":"CAM01","destination_camera_id":"CAM02","distance_meters":4200,
+        })
+        summary = self.client.get("/api/plates/GJ01AB1234/suspicion").json()
+        self.assertEqual(summary["classification"], "suspicious")
+        self.assertTrue(any(item["type"] == "impossible_travel" for item in summary["evaluated_evidence"]))
+        self.assertEqual(self.client.get("/api/anomalies").json()["total"], 1)
+
+    def test_cloned_plate_simultaneous_sighting_evidence(self):
+        first = self._valid_event("CAM01")
+        second = self._valid_event("CAM03")
+        self._set_timestamps([
+            (first, dt.datetime(2026, 9, 13, 10, 0, 0)),
+            (second, dt.datetime(2026, 9, 13, 10, 0, 5)),
+        ])
+        summary = self.client.get("/api/plates/GJ01AB1234/suspicion").json()
+        self.assertEqual(summary["classification"], "suspicious")
+        overlap = [item for item in summary["evaluated_evidence"] if item["type"] == "simultaneous_sighting"]
+        self.assertEqual(len(overlap), 1)
+        self.assertEqual(overlap[0]["time_delta_seconds"], 5.0)
+
+    def test_cloned_plate_appearance_type_and_color_conflict_evidence(self):
+        first = self._valid_event("CAM01", appearance_embedding=self._test_embedding([1, 0, 0, 0]),
+                                  appearance_model="test", appearance_embedding_version="test",
+                                  vehicle_type="car", vehicle_color="white")
+        second = self._valid_event("CAM04", appearance_embedding=self._test_embedding([0, 1, 0, 0]),
+                                   appearance_model="test", appearance_embedding_version="test",
+                                   vehicle_type="motorcycle", vehicle_color="black")
+        self._set_timestamps([
+            (first, dt.datetime(2026, 9, 13, 10, 0, 0)),
+            (second, dt.datetime(2026, 9, 13, 10, 10, 0)),
+        ])
+        summary = self.client.get("/api/plates/GJ01AB1234/suspicion").json()
+        evidence_types = {item["type"] for item in summary["evaluated_evidence"]}
+        self.assertIn("appearance_conflict", evidence_types)
+        self.assertIn("vehicle_type_conflict", evidence_types)
+        self.assertIn("vehicle_color_conflict", evidence_types)
+        self.assertGreaterEqual(summary["suspicion_score"], 7.0)
+
+    def test_cloned_plate_multiple_evidence_high_suspicion(self):
+        first = self._valid_event("CAM01", appearance_embedding=self._test_embedding([1, 0, 0, 0]),
+                                  appearance_model="test", appearance_embedding_version="test",
+                                  vehicle_type="car")
+        second = self._valid_event("CAM02", appearance_embedding=self._test_embedding([0, 1, 0, 0]),
+                                   appearance_model="test", appearance_embedding_version="test",
+                                   vehicle_type="motorcycle")
+        self._set_timestamps([
+            (first, dt.datetime(2026, 9, 13, 10, 0, 0)),
+            (second, dt.datetime(2026, 9, 13, 10, 1, 0)),
+        ])
+        self.client.post("/api/camera-road-connections", json={
+            "source_camera_id":"CAM01","destination_camera_id":"CAM02","distance_meters":4200,
+        })
+        summary = self.client.get("/api/plates/GJ01AB1234/suspicion").json()
+        self.assertEqual(summary["classification"], "high_suspicion")
+        evidence_types = {item["type"] for item in summary["evaluated_evidence"]}
+        self.assertIn("impossible_travel", evidence_types)
+        self.assertIn("appearance_conflict", evidence_types)
+        self.assertIn("vehicle_type_conflict", evidence_types)
+        self.assertFalse(summary["confirmed_cloned_plate"])
+
+    def test_cloned_plate_weak_color_only_not_high_suspicion(self):
+        first = self._valid_event("CAM01", vehicle_color="white")
+        second = self._valid_event("CAM04", vehicle_color="black")
+        self._set_timestamps([
+            (first, dt.datetime(2026, 9, 13, 10, 0, 0)),
+            (second, dt.datetime(2026, 9, 13, 10, 10, 0)),
+        ])
+        summary = self.client.get("/api/plates/GJ01AB1234/suspicion").json()
+        self.assertEqual(summary["classification"], "normal")
+        self.assertEqual(summary["total"], 0)
+        self.assertIn("vehicle_color_conflict", {item["type"] for item in summary["evaluated_evidence"]})
+
+    def test_cloned_plate_invalid_ocr_not_used(self):
+        persist_plate_event(dict(camera_id="CAM01", plate_text="D", confidence=.99, status="ok"))
+        persist_plate_event(dict(camera_id="CAM02", plate_text="D", confidence=.99, status="ok"))
+        summary = self.client.get("/api/plates/D/suspicion").json()
+        self.assertEqual(summary["classification"], "normal")
+        self.assertEqual(summary["evaluated_evidence"], [])
+        self.assertEqual(self.client.get("/api/plate-suspicions").json()["total"], 0)
+        with SessionLocal() as db:
+            self.assertEqual(db.query(Vehicle).count(), 0)
+
+    def test_cloned_plate_duplicate_evaluation_review_and_trajectory_fields(self):
+        first = self._valid_event("CAM01", appearance_embedding=self._test_embedding([1, 0, 0, 0]),
+                                  appearance_model="test", appearance_embedding_version="test")
+        second = self._valid_event("CAM02", appearance_embedding=self._test_embedding([0, 1, 0, 0]),
+                                   appearance_model="test", appearance_embedding_version="test")
+        vehicle_id = first.vehicle_id
+        self._set_timestamps([
+            (first, dt.datetime(2026, 9, 13, 10, 0, 0)),
+            (second, dt.datetime(2026, 9, 13, 10, 1, 0)),
+        ])
+        self.client.post("/api/camera-road-connections", json={
+            "source_camera_id":"CAM01","destination_camera_id":"CAM02","distance_meters":4200,
+        })
+        self.client.get("/api/plates/GJ01AB1234/suspicion")
+        self.client.get("/api/plates/GJ01AB1234/suspicion")
+        queue = self.client.get("/api/plate-suspicions").json()
+        self.assertEqual(queue["total"], 1)
+        suspicion = queue["items"][0]
+        self.assertIn(suspicion["classification"], {"suspicious", "high_suspicion"})
+        reviewed = self.client.patch(f"/api/plate-suspicions/{suspicion['id']}/review",
+                                     json={"status":"acknowledged", "reviewed_by":"tester"}).json()
+        self.assertEqual(reviewed["status"], "acknowledged")
+        route = self.client.get("/api/trajectory/GJ01AB1234").json()
+        self.assertIn(route["trajectory_hops"][0]["plate_suspicion_status"], {"suspicious", "high_suspicion"})
+        self.assertGreater(route["trajectory_hops"][0]["plate_suspicion_score"], 0)
+        with SessionLocal() as db:
+            self.assertEqual(db.get(PlateEvent, first.id).vehicle_id, vehicle_id)
+            self.assertEqual(db.get(PlateEvent, second.id).vehicle_id, vehicle_id)
+
+    def _connect(self, source, destination, distance=1000, direction=None):
+        payload = {"source_camera_id": source, "destination_camera_id": destination, "distance_meters": distance}
+        if direction:
+            payload["direction"] = direction
+        return self.client.post("/api/camera-road-connections", json=payload)
+
+    def _route_event(self, camera_id, plate_text="GJ01AB1234"):
+        return persist_plate_event(
+            dict(camera_id=camera_id, plate_text=plate_text, confidence=.95, status="ok"),
+            window_seconds=0,
+        )[0]
+
+    def _route_sequence(self, cameras, seconds_step=300, plate_text="GJ01AB1234"):
+        events = [self._route_event(camera_id, plate_text=plate_text) for camera_id in cameras]
+        start = dt.datetime(2026, 9, 13, 10, 0, 0)
+        with SessionLocal() as db:
+            for index, event in enumerate(events):
+                db.get(PlateEvent, event.id).timestamp = start + dt.timedelta(seconds=index * seconds_step)
+            db.commit()
+        return events
+
+    def test_route_anomaly_insufficient_history(self):
+        self._connect("CAM01", "CAM02")
+        self._connect("CAM02", "CAM03")
+        events = self._route_sequence(["CAM01", "CAM02", "CAM03"])
+        summary = self.client.get(f"/api/vehicles/{events[0].vehicle_id}/route-anomalies").json()
+        self.assertEqual(summary["classification"], "insufficient_history")
+        self.assertEqual(summary["total"], 0)
+
+    def test_route_anomaly_normal_historical_route(self):
+        self._connect("CAM01", "CAM02")
+        self._connect("CAM02", "CAM03")
+        events = self._route_sequence(["CAM01", "CAM02", "CAM03", "CAM01", "CAM02", "CAM03"])
+        summary = self.client.get(f"/api/vehicles/{events[0].vehicle_id}/route-anomalies").json()
+        self.assertEqual(summary["classification"], "normal")
+        self.assertEqual(summary["route_anomaly_score"], 0.0)
+        self.assertEqual(summary["total"], 0)
+
+    def test_route_anomaly_new_but_valid_route_is_unusual(self):
+        self._connect("CAM01", "CAM02")
+        self._connect("CAM02", "CAM03")
+        self._connect("CAM02", "CAM04")
+        events = self._route_sequence(["CAM01", "CAM02", "CAM03", "CAM01", "CAM02", "CAM04"])
+        summary = self.client.get(f"/api/vehicles/{events[0].vehicle_id}/route-anomalies").json()
+        self.assertEqual(summary["classification"], "unusual_route")
+        self.assertEqual(summary["evidence"]["unseen_transition_count"], 1)
+        self.assertAlmostEqual(summary["evidence"]["route_deviation_ratio"], .5)
+
+    def test_route_anomaly_disconnected_and_high_deviation_evidence(self):
+        self._connect("CAM01", "CAM02")
+        self._connect("CAM02", "CAM03")
+        events = self._route_sequence(["CAM01", "CAM02", "CAM03", "CAM04", "CAM01", "CAM04"])
+        summary = self.client.get(f"/api/vehicles/{events[0].vehicle_id}/route-anomalies").json()
+        self.assertEqual(summary["classification"], "high_route_anomaly")
+        disconnected = summary["evidence"]["disconnected_transitions"]
+        self.assertTrue(any(item["source_camera_id"] == "CAM01" and item["destination_camera_id"] == "CAM04"
+                            for item in disconnected))
+        self.assertEqual(summary["evidence"]["unseen_transition_count"], 2)
+
+    def test_route_anomaly_direction_conflict_when_available(self):
+        self._connect("CAM01", "CAM02", direction="NE")
+        self._connect("CAM02", "CAM03", direction="E")
+        self._connect("CAM03", "CAM02", direction="W")
+        self._connect("CAM02", "CAM01", direction="SW")
+        events = self._route_sequence(["CAM01", "CAM02", "CAM03", "CAM03", "CAM02", "CAM01"])
+        summary = self.client.get(f"/api/vehicles/{events[0].vehicle_id}/route-anomalies").json()
+        conflicts = summary["evidence"]["direction_conflicts"]
+        self.assertTrue(any(item["source_camera_id"] == "CAM02" and item["destination_camera_id"] == "CAM01"
+                            for item in conflicts))
+
+    def test_route_anomaly_includes_impossible_and_plate_suspicion_context(self):
+        self._connect("CAM01", "CAM02", distance=4200)
+        self._connect("CAM02", "CAM03")
+        events = self._route_sequence(["CAM01", "CAM02", "CAM03", "CAM01", "CAM02"], seconds_step=300)
+        with SessionLocal() as db:
+            db.get(PlateEvent, events[-2].id).timestamp = dt.datetime(2026, 9, 13, 11, 0, 0)
+            db.get(PlateEvent, events[-1].id).timestamp = dt.datetime(2026, 9, 13, 11, 1, 0)
+            db.commit()
+        self.client.get("/api/trajectory/GJ01AB1234")
+        self.client.get("/api/plates/GJ01AB1234/suspicion")
+        summary = self.client.get(f"/api/vehicles/{events[0].vehicle_id}/route-anomalies").json()
+        self.assertTrue(summary["evidence"]["impossible_travel_context"])
+        self.assertTrue(summary["evidence"]["plate_suspicion_context"])
+
+    def test_route_anomaly_invalid_ocr_no_fake_route_identity(self):
+        persist_plate_event(dict(camera_id="CAM01", plate_text="D", confidence=.99, status="ok"), window_seconds=0)
+        persist_plate_event(dict(camera_id="CAM02", plate_text="D", confidence=.99, status="ok"), window_seconds=0)
+        self.assertEqual(self.client.get("/api/route-anomalies").json()["total"], 0)
+        with SessionLocal() as db:
+            self.assertEqual(db.query(Vehicle).count(), 0)
+
+    def test_route_anomaly_duplicate_review_trajectory_and_identity_safety(self):
+        self._connect("CAM01", "CAM02")
+        self._connect("CAM02", "CAM03")
+        events = self._route_sequence(["CAM01", "CAM02", "CAM03", "CAM04", "CAM01", "CAM04"])
+        vehicle_id = events[0].vehicle_id
+        self.client.get(f"/api/vehicles/{vehicle_id}/route-anomalies")
+        self.client.get(f"/api/vehicles/{vehicle_id}/route-anomalies")
+        queue = self.client.get("/api/route-anomalies").json()
+        self.assertEqual(queue["total"], 1)
+        route_item = queue["items"][0]
+        reviewed = self.client.patch(f"/api/route-anomalies/{route_item['id']}/review",
+                                     json={"status":"dismissed", "reviewed_by":"tester"}).json()
+        self.assertEqual(reviewed["status"], "dismissed")
+        trajectory = self.client.get("/api/trajectory/GJ01AB1234").json()
+        self.assertEqual(trajectory["route_anomaly"]["classification"], "high_route_anomaly")
+        self.assertEqual(trajectory["trajectory_hops"][-1]["route_anomaly_status"], "high_route_anomaly")
+        with SessionLocal() as db:
+            self.assertTrue(all(db.get(PlateEvent, event.id).vehicle_id == vehicle_id for event in events))
+
+    def test_vehicle_investigation_lookup_summary_history_and_speed(self):
+        first = self._valid_event("CAM01", vehicle_color="white", vehicle_type="car",
+                                  appearance_embedding=self._test_embedding([1, 0, 0, 0]),
+                                  appearance_model="test", appearance_embedding_version="test",
+                                  appearance_quality=9.0)
+        second = self._valid_event("CAM02", vehicle_color="white", vehicle_type="car",
+                                   appearance_embedding=self._test_embedding([1, 0, 0, 0]),
+                                   appearance_model="test", appearance_embedding_version="test",
+                                   appearance_quality=9.0)
+        self._set_timestamps([
+            (second, dt.datetime(2026, 9, 13, 10, 6, 18)),
+            (first, dt.datetime(2026, 9, 13, 10, 0, 0)),
+        ])
+        self._connect("CAM01", "CAM02", distance=4200)
+
+        by_id = self.client.get(f"/api/vehicles/{first.vehicle_id}/investigation")
+        self.assertEqual(by_id.status_code, 200, by_id.text)
+        data = by_id.json()
+        self.assertEqual(data["summary"]["global_vehicle_id"], first.vehicle_id)
+        self.assertEqual(data["summary"]["primary_plate_text"], "GJ01AB1234")
+        self.assertEqual(data["summary"]["observation_count"], 2)
+        self.assertEqual(data["summary"]["camera_count"], 2)
+        self.assertEqual(data["summary"]["trajectory_segment_count"], 1)
+        self.assertEqual(data["summary"]["status_summary"], "No concerns")
+        self.assertEqual([item["event_id"] for item in data["history"]["observations"]], [first.id, second.id])
+        self.assertAlmostEqual(data["trajectory"]["trajectory_hops"][0]["estimated_speed_kmh"], 40.0, places=1)
+        self.assertEqual(data["appearance"]["available_observation_count"], 2)
+        self.assertGreaterEqual(data["appearance"]["comparisons"][0]["appearance_similarity"], .99)
+        self.assertEqual(data["explanations"], [])
+
+        by_plate = self.client.get("/api/plates/GJ01AB1234/investigation").json()
+        self.assertEqual(by_plate["summary"]["global_vehicle_id"], first.vehicle_id)
+        self.assertIn("review_actions", by_plate)
+
+    def test_vehicle_investigation_includes_impossible_plate_suspicion_and_timeline(self):
+        self._connect("CAM01", "CAM02", distance=4200)
+        first = self._valid_event("CAM01", appearance_embedding=self._test_embedding([1, 0, 0, 0]),
+                                  appearance_model="test", appearance_embedding_version="test",
+                                  vehicle_type="car")
+        second = self._valid_event("CAM02", appearance_embedding=self._test_embedding([0, 1, 0, 0]),
+                                   appearance_model="test", appearance_embedding_version="test",
+                                   vehicle_type="motorcycle")
+        self._set_timestamps([
+            (first, dt.datetime(2026, 9, 13, 10, 0, 0)),
+            (second, dt.datetime(2026, 9, 13, 10, 1, 0)),
+        ])
+        self.client.get("/api/trajectory/GJ01AB1234")
+        self.client.get("/api/plates/GJ01AB1234/suspicion")
+
+        data = self.client.get(f"/api/vehicles/{first.vehicle_id}/investigation").json()
+        evidence_types = {item["type"] for item in data["explanations"]}
+        self.assertIn("impossible_travel", evidence_types)
+        self.assertIn("plate_suspicion", evidence_types)
+        self.assertIn("appearance_conflict", evidence_types)
+        self.assertIn(data["summary"]["plate_suspicion"], {"suspicious", "high_suspicion"})
+        self.assertEqual(data["anomalies"]["total"], 1)
+        self.assertGreaterEqual(data["plate_suspicions"]["total"], 1)
+        self.assertTrue(any(item["type"] == "plate_suspicion" for item in data["timeline"]))
+        self.assertFalse(data["summary"]["confirmed_cloned_plate"])
+        self.assertFalse(data["summary"]["confirmed_criminal_activity"])
+
+    def test_vehicle_investigation_includes_route_anomaly_context(self):
+        self._connect("CAM01", "CAM02")
+        self._connect("CAM02", "CAM03")
+        events = self._route_sequence(["CAM01", "CAM02", "CAM03", "CAM04", "CAM01", "CAM04"])
+        self.client.get(f"/api/vehicles/{events[0].vehicle_id}/route-anomalies")
+
+        data = self.client.get(f"/api/vehicles/{events[0].vehicle_id}/investigation").json()
+        self.assertEqual(data["route_anomalies"]["classification"], "high_route_anomaly")
+        self.assertEqual(data["summary"]["route_anomaly"], "high_route_anomaly")
+        self.assertIn("route_anomaly", {item["type"] for item in data["explanations"]})
+        self.assertTrue(any(item["type"] == "route_anomaly" for item in data["timeline"]))
+        self.assertEqual(data["trajectory"]["route_anomaly"]["classification"], "high_route_anomaly")
+
+    def test_vehicle_investigation_unknown_and_invalid_ocr_safety(self):
+        self.assertEqual(self.client.get("/api/vehicles/VEH-NOTFOUND/investigation").status_code, 404)
+        self.assertEqual(self.client.get("/api/plates/GJ01AB1234/investigation").status_code, 404)
+        persist_plate_event(dict(camera_id="CAM01", plate_text="D", confidence=.99, status="ok"), window_seconds=0)
+        persist_plate_event(dict(camera_id="CAM02", plate_text="112", confidence=.99, status="ok"), window_seconds=0)
+        self.assertEqual(self.client.get("/api/plates/D/investigation").status_code, 404)
+        with SessionLocal() as db:
+            self.assertEqual(db.query(Vehicle).count(), 0)
+
+    def test_vehicle_investigation_existing_apis_remain_compatible(self):
+        self._connect("CAM01", "CAM02", distance=4200)
+        first, second = self._fixed_pair(378)
+        vehicle_id = first.vehicle_id
+        investigation = self.client.get(f"/api/vehicles/{vehicle_id}/investigation").json()
+        self.assertEqual(investigation["summary"]["global_vehicle_id"], vehicle_id)
+        self.assertEqual(self.client.get(f"/api/vehicles/{vehicle_id}/history").status_code, 200)
+        self.assertEqual(self.client.get("/api/trajectory/GJ01AB1234").status_code, 200)
+        self.assertEqual(self.client.get(f"/api/vehicles/{vehicle_id}/anomalies").status_code, 200)
+        self.assertEqual(self.client.get("/api/plates/GJ01AB1234/suspicion").status_code, 200)
+        self.assertEqual(self.client.get(f"/api/vehicles/{vehicle_id}/route-anomalies").status_code, 200)
+        with SessionLocal() as db:
+            self.assertEqual(db.get(PlateEvent, first.id).vehicle_id, vehicle_id)
+            self.assertEqual(db.get(PlateEvent, second.id).vehicle_id, vehicle_id)
+
+    def _traffic_event(self, camera_id, plate_text, timestamp, **extra):
+        values = dict(camera_id=camera_id, plate_text=plate_text, confidence=.95, status="ok")
+        values.update(extra)
+        event = persist_plate_event(values, window_seconds=0)[0]
+        with SessionLocal() as db:
+            db.get(PlateEvent, event.id).timestamp = timestamp
+            db.commit()
+        return event
+
+    def test_traffic_summary_camera_counts_and_invalid_ocr_safety(self):
+        start = dt.datetime(2026, 9, 13, 10, 0, 0)
+        first = self._traffic_event("CAM01", "GJ01AB1234", start)
+        self._traffic_event("CAM01", "GJ01AB5678", start + dt.timedelta(minutes=5))
+        persist_plate_event(dict(camera_id="CAM01", plate_text="D", confidence=.99, status="ok"), window_seconds=0)
+
+        summary = self.client.get("/api/traffic/summary").json()
+        self.assertEqual(summary["total_observations"], 3)
+        self.assertEqual(summary["unique_vehicle_count"], 2)
+        self.assertEqual(summary["busiest_camera"]["camera_id"], "CAM01")
+        cameras = self.client.get("/api/traffic/cameras", params={"camera_id":"CAM01"}).json()["items"]
+        self.assertEqual(cameras[0]["observation_count"], 3)
+        self.assertEqual(cameras[0]["unique_vehicle_count"], 2)
+        self.assertEqual(cameras[0]["missing_identity_observation_count"], 1)
+        self.assertEqual(self.client.get("/api/traffic/cameras", params={"camera_id":"CAMXX"}).status_code, 404)
+        with SessionLocal() as db:
+            self.assertEqual(db.get(PlateEvent, first.id).vehicle_id, first.vehicle_id)
+
+    def test_traffic_timeseries_hourly_daily_and_filtering(self):
+        base = dt.datetime(2026, 9, 13, 10, 15, 0)
+        self._traffic_event("CAM01", "GJ01AB1234", base)
+        self._traffic_event("CAM02", "GJ01AB5678", base + dt.timedelta(hours=1))
+        self._traffic_event("CAM02", "GJ01AB9999", base + dt.timedelta(days=1))
+        hourly = self.client.get("/api/traffic/timeseries", params={"bucket":"hour"}).json()["items"]
+        self.assertTrue(any(item["time_bucket"].startswith("2026-09-13T10:00:00") and item["camera_id"] == "CAM01"
+                            for item in hourly))
+        daily = self.client.get("/api/traffic/timeseries", params={"bucket":"day"}).json()["items"]
+        self.assertEqual(len({item["time_bucket"] for item in daily}), 2)
+        filtered = self.client.get("/api/traffic/summary", params={
+            "start": base.isoformat(),
+            "end": (base + dt.timedelta(hours=2)).isoformat(),
+        }).json()
+        self.assertEqual(filtered["total_observations"], 2)
+        self.assertEqual(self.client.get("/api/traffic/timeseries", params={"bucket":"week"}).status_code, 422)
+
+    def test_traffic_flow_od_matrix_and_road_speed_reuse(self):
+        self._connect("CAM01", "CAM02", distance=4200, direction="NE")
+        self._connect("CAM02", "CAM03", distance=3800, direction="E")
+        events = self._route_sequence(["CAM01", "CAM02", "CAM03"], seconds_step=378)
+        with SessionLocal() as db:
+            db.get(PlateEvent, events[2].id).timestamp = dt.datetime(2026, 9, 13, 10, 12, 40)
+            db.commit()
+
+        flow = self.client.get("/api/traffic/flow").json()["items"]
+        self.assertTrue(any(item["origin"] == "CAM01" and item["destination"] == "CAM02"
+                            and item["vehicle_count"] == 1 for item in flow))
+        od = self.client.get("/api/traffic/od-matrix", params={"bucket":"hour"}).json()["items"]
+        self.assertTrue(any(item["origin"] == "CAM02" and item["destination"] == "CAM03"
+                            and item["vehicle_count"] == 1 for item in od))
+        roads = self.client.get("/api/traffic/roads").json()["items"]
+        cam01_cam02 = next(item for item in roads if item["source_camera_id"] == "CAM01"
+                           and item["destination_camera_id"] == "CAM02")
+        self.assertAlmostEqual(cam01_cam02["average_estimated_speed_kmh"], 40.0, places=1)
+        self.assertEqual(cam01_cam02["valid_speed_segment_count"], 1)
+        self.assertEqual(cam01_cam02["utilization"]["metric_note"],
+                         "Relative utilization/activity; no physical road capacity is configured.")
+
+    def test_traffic_density_congestion_heatmap_and_lane_status(self):
+        with patch.dict(os.environ, {
+            "ANPR_TRAFFIC_LOW_THRESHOLD": "1",
+            "ANPR_TRAFFIC_MEDIUM_THRESHOLD": "2",
+            "ANPR_CONGESTION_WATCH_SPEED_KMH": "50",
+            "ANPR_CONGESTION_CONGESTED_SPEED_KMH": "10",
+            "ANPR_CONGESTION_WATCH_VOLUME": "1",
+            "ANPR_CONGESTION_CONGESTED_VOLUME": "1",
+        }):
+            self._connect("CAM01", "CAM02", distance=1000)
+            first = self._traffic_event("CAM01", "GJ01AB1234", dt.datetime(2026, 9, 13, 10, 0, 0))
+            second = self._traffic_event("CAM02", "GJ01AB1234", dt.datetime(2026, 9, 13, 10, 5, 0))
+            density = self.client.get("/api/traffic/density", params={"camera_id":"CAM01"}).json()["items"][0]
+            self.assertEqual(density["density_level"], "MEDIUM")
+            congestion = self.client.get("/api/traffic/congestion").json()["items"]
+            road = next(item for item in congestion if item["source_camera_id"] == "CAM01")
+            self.assertEqual(road["congestion_status"], "WATCH")
+            heatmap = self.client.get("/api/traffic/heatmap").json()["points"]
+            self.assertTrue(any(item["camera_id"] == "CAM01" and item["traffic_count"] == 1 for item in heatmap))
+            lanes = self.client.get("/api/traffic/lanes").json()
+            self.assertEqual(lanes["status"], "not_configured")
+            with SessionLocal() as db:
+                self.assertEqual(db.get(PlateEvent, first.id).vehicle_id, db.get(PlateEvent, second.id).vehicle_id)
+
+    def test_traffic_dwell_missing_timestamps_and_empty_dataset(self):
+        empty = self.client.get("/api/traffic/dashboard").json()
+        self.assertEqual(empty["summary"]["total_observations"], 0)
+        start = dt.datetime(2026, 9, 13, 10, 0, 0)
+        first = self._traffic_event("CAM01", "GJ01AB1234", start)
+        second = self._traffic_event("CAM01", "GJ01AB1234", start + dt.timedelta(minutes=7))
+        missing = self._traffic_event("CAM02", "GJ01AB5678", start + dt.timedelta(minutes=9))
+        with SessionLocal() as db:
+            db.get(PlateEvent, missing.id).timestamp = None
+            db.commit()
+        dwell = self.client.get("/api/traffic/dwell", params={"bucket":"hour"}).json()["items"]
+        cam01 = next(item for item in dwell if item["camera_id"] == "CAM01")
+        self.assertEqual(cam01["dwell_status"], "estimated")
+        self.assertEqual(cam01["average_dwell_seconds"], 420)
+        timeseries = self.client.get("/api/traffic/timeseries").json()["items"]
+        self.assertFalse(any(item["camera_id"] == "CAM02" for item in timeseries))
+        with SessionLocal() as db:
+            self.assertEqual(db.get(PlateEvent, first.id).vehicle_id, db.get(PlateEvent, second.id).vehicle_id)
+
+    def test_traffic_existing_apis_still_work(self):
+        self._connect("CAM01", "CAM02", distance=4200)
+        first, _second = self._fixed_pair(378)
+        self.assertEqual(self.client.get("/api/traffic/dashboard").status_code, 200)
+        self.assertEqual(self.client.get(f"/api/vehicles/{first.vehicle_id}/history").status_code, 200)
+        self.assertEqual(self.client.get("/api/trajectory/GJ01AB1234").status_code, 200)
+        self.assertEqual(self.client.get("/api/vehicles").status_code, 200)
 
     def test_concurrent_duplicate_filter(self):
         value = dict(camera_id="CAM01",plate_text="GJ01AB1234",confidence=.9,status="ok")
