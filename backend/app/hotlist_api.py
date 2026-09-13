@@ -7,10 +7,20 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from app.database import get_db, HotlistEntry, HotlistAlert
 from app.hotlist import entry_payload, alert_payload, notify, utcnow
+from app.enforcement import acknowledge_incident_for_alert, incident_for_alert_payload
 from app.location import utc_naive
 from app.plate_rules import normalize_plate_text
 
 router = APIRouter(prefix="/api", tags=["Hotlist"])
+
+
+def alert_with_incident(db, alert):
+    payload = alert_payload(alert)
+    incident = incident_for_alert_payload(db, alert.id)
+    if incident:
+        payload["incident_id"] = incident["incident_id"]
+        payload["enforcement_incident"] = incident
+    return payload
 
 
 class EntryInput(BaseModel):
@@ -100,7 +110,7 @@ def list_alerts(unacknowledged: bool = False, camera_id: str | None = None,
         query = query.filter(HotlistAlert.acknowledged_at.is_(None), HotlistAlert.match_status != "retracted")
     if camera_id:
         query = query.filter(HotlistAlert.camera_id == camera_id)
-    return {"total": query.count(), "items": [alert_payload(a) for a in
+    return {"total": query.count(), "items": [alert_with_incident(db, a) for a in
             query.order_by(HotlistAlert.id.desc()).offset(offset).limit(limit)]}
 
 
@@ -114,6 +124,7 @@ def acknowledge(alert_id: int, db: Session = Depends(get_db)):
     if not alert.acknowledged_at:
         alert.acknowledged_at = utcnow()
         alert.revision += 1
+        acknowledge_incident_for_alert(db, alert.id)
         notify(db, alert)
         db.commit()
-    return alert_payload(alert)
+    return alert_with_incident(db, alert)

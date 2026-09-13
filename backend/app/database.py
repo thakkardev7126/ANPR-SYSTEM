@@ -262,6 +262,51 @@ class HotlistNotification(Base):
     alert_id = Column(Integer, nullable=False, index=True)
 
 
+class PCRVehicle(Base):
+    """Demo patrol/PCR vehicle location reported by a manual or simulated feed."""
+    __tablename__ = "pcr_vehicles"
+
+    pcr_id = Column(String(32), primary_key=True, index=True)
+    name = Column(String(80), nullable=False)
+    call_sign = Column(String(80), nullable=True)
+    vehicle_identifier = Column(String(80), nullable=False, default="")
+    lat = Column(Float, nullable=True)
+    lng = Column(Float, nullable=True)
+    status = Column(String(20), nullable=False, default="AVAILABLE", index=True)
+    active = Column(Boolean, nullable=False, default=True, index=True)
+    last_seen_at = Column(DateTime, nullable=True, index=True)
+    contact_channel = Column(String(120), nullable=False, default="")
+    metadata_json = Column(Text, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+
+
+class EnforcementIncident(Base):
+    """Assistive incident-command record linked one-to-one with a hotlist alert."""
+    __tablename__ = "enforcement_incidents"
+    __table_args__ = (UniqueConstraint("hotlist_alert_id", name="uq_enforcement_hotlist_alert"),)
+
+    id = Column(Integer, primary_key=True)
+    hotlist_alert_id = Column(Integer, nullable=False, index=True)
+    vehicle_id = Column(String, nullable=True, index=True)
+    plate_text = Column(String(24), nullable=False, index=True)
+    camera_id = Column(String, nullable=False, index=True)
+    event_id = Column(Integer, nullable=True, index=True)
+    detected_at = Column(DateTime, nullable=False, index=True)
+    recommended_pcr_id = Column(String(32), nullable=True, index=True)
+    pcr_distance_meters = Column(Float, nullable=True)
+    pcr_location_status = Column(String(20), nullable=False, default="UNKNOWN")
+    recommendation_status = Column(String(40), nullable=False, default="NO_AVAILABLE_PCR", index=True)
+    recommendation_reason = Column(String(240), nullable=False, default="")
+    recommendation_calculated_at = Column(DateTime, nullable=True)
+    status = Column(String(40), nullable=False, default="NEW", index=True)
+    trajectory_reference = Column(String(240), nullable=False, default="")
+    investigation_reference = Column(String(240), nullable=False, default="")
+    created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+    updated_by = Column(String(80), nullable=True)
+
+
 def _sanitize_plate(value):
     from app.plate_rules import strip_hsrp_noise
     return strip_hsrp_noise(value)

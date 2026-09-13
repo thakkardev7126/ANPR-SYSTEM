@@ -26,7 +26,7 @@ from app import anpr_pipeline as pipeline
 from app.plate_rules import normalize_plate_text, strip_hsrp_noise
 from app.image_quality import padded_plate_crop, normalize_size, assess_quality, enhanced_variants, PartialPlateHistory
 from app.location import resolve_location
-from app.database import SessionLocal, PlateEvent, Camera, CameraRoadConnection, Vehicle, VehicleMatchCandidate, VehicleAnomaly, PlateSuspicionEvent, RouteAnomalyEvent, persist_plate_event, engine, HotlistEntry, HotlistAlert, HotlistNotification
+from app.database import SessionLocal, PlateEvent, Camera, CameraRoadConnection, Vehicle, VehicleMatchCandidate, VehicleAnomaly, PlateSuspicionEvent, RouteAnomalyEvent, persist_plate_event, engine, HotlistEntry, HotlistAlert, HotlistNotification, PCRVehicle, EnforcementIncident
 from app.main import app
 from app.seed_cameras import seed
 from app.road_network import camera_transition
@@ -316,6 +316,8 @@ class APITests(unittest.TestCase):
     def setUp(self):
         with SessionLocal() as db:
             db.query(CameraRoadConnection).delete()
+            db.query(EnforcementIncident).delete()
+            db.query(PCRVehicle).delete()
             db.query(HotlistNotification).delete()
             db.query(HotlistAlert).delete()
             db.query(HotlistEntry).delete()
@@ -1698,6 +1700,150 @@ class APITests(unittest.TestCase):
             self.assertEqual(socket.receive_json()["type"],"connected")
             socket.send_json({"action":"ping"})
             self.assertEqual(socket.receive_json()["type"],"pong")
+
+    def add_pcr(self, pcr_id="PCR01", lat=23.0325, lng=72.5245, status="AVAILABLE", **extra):
+        body = dict(pcr_id=pcr_id, name=pcr_id, vehicle_identifier=f"DEMO-{pcr_id}",
+                    latitude=lat, longitude=lng, status=status,
+                    last_seen_at=dt.datetime.utcnow().isoformat(), contact_channel="Demo PCR GPS")
+        body.update(extra)
+        response = self.client.post("/api/pcr", json=body)
+        self.assertEqual(response.status_code, 201, response.text)
+        return response.json()
+
+    def test_pcr_creation_retrieval_and_location_update(self):
+        created = self.add_pcr("PCR10")
+        self.assertEqual(created["pcr_id"], "PCR10")
+        self.assertEqual(created["location_status"], "LIVE")
+        listed = self.client.get("/api/pcr").json()
+        self.assertEqual(listed["items"][0]["pcr_id"], "PCR10")
+        one = self.client.get("/api/pcr/PCR10").json()
+        self.assertEqual(one["vehicle_identifier"], "DEMO-PCR10")
+        stamp = dt.datetime.utcnow().replace(microsecond=0)
+        updated = self.client.post("/api/pcr/PCR10/location", json={
+            "latitude": 23.04,
+            "longitude": 72.53,
+            "timestamp": stamp.isoformat(),
+        })
+        self.assertEqual(updated.status_code, 200, updated.text)
+        data = updated.json()
+        self.assertEqual(data["latitude"], 23.04)
+        self.assertEqual(data["longitude"], 72.53)
+
+    def test_pcr_coordinate_and_timestamp_validation(self):
+        self.assertEqual(self.client.post("/api/pcr", json={
+            "pcr_id":"PCRBAD", "latitude":91, "longitude":72.5,
+        }).status_code, 422)
+        self.assertEqual(self.client.post("/api/pcr", json={
+            "pcr_id":"PCRBAD", "latitude":23.0, "longitude":181,
+        }).status_code, 422)
+        self.add_pcr("PCR11")
+        self.assertEqual(self.client.post("/api/pcr/PCR11/location", json={
+            "latitude": 23.0, "longitude": 181, "timestamp": dt.datetime.utcnow().isoformat(),
+        }).status_code, 422)
+        self.assertEqual(self.client.post("/api/pcr/PCR11/location", json={
+            "latitude": 23.0, "longitude": 72.0,
+        }).status_code, 422)
+        self.assertEqual(self.client.get("/api/pcr/PCRXX").status_code, 404)
+
+    def test_nearest_pcr_filters_busy_stale_and_unavailable(self):
+        self.client.patch("/api/cameras/CAM02", json={"lat":23.0325,"lng":72.5145})
+        now = dt.datetime.utcnow()
+        with patch.dict(os.environ, {"ANPR_PCR_LOCATION_MAX_AGE_SECONDS":"60"}):
+            self.add_pcr("PCR01", 23.0500, 72.5400, "AVAILABLE", last_seen_at=now.isoformat())
+            self.add_pcr("PCR02", 23.0330, 72.5240, "AVAILABLE", last_seen_at=now.isoformat())
+            self.add_pcr("PCR03", 23.0328, 72.5150, "BUSY", last_seen_at=now.isoformat())
+            self.add_pcr("PCR04", 23.0331, 72.5160, "AVAILABLE",
+                         last_seen_at=(now - dt.timedelta(minutes=10)).isoformat())
+            data = self.client.get("/api/pcr/nearest", params={"camera_id":"CAM02"}).json()
+        self.assertEqual(data["recommended_pcr"]["pcr_id"], "PCR02")
+        self.assertEqual(data["recommended_pcr"]["location_status"], "LIVE")
+        self.assertTrue(any(item["pcr_id"] == "PCR03" and not item["eligible"] for item in data["candidates"]))
+        self.assertTrue(any(item["pcr_id"] == "PCR04" and item["location_status"] == "STALE" for item in data["candidates"]))
+
+    def test_nearest_pcr_no_available_and_no_camera_coordinates(self):
+        self.client.patch("/api/cameras/CAM02", json={"lat":23.0325,"lng":72.5145})
+        self.add_pcr("PCR01", 23.0330, 72.5240, "BUSY")
+        self.add_pcr("PCR02", 23.0340, 72.5250, "OFFLINE")
+        data = self.client.get("/api/pcr/nearest", params={"camera_id":"CAM02"}).json()
+        self.assertIsNone(data["recommended_pcr"])
+        self.assertEqual(data["reason"], "NO_AVAILABLE_PCR")
+        self.client.post("/api/cameras", json={"camera_id":"CAMNOLOC"})
+        missing = self.client.get("/api/pcr/nearest", params={"camera_id":"CAMNOLOC"}).json()
+        self.assertIsNone(missing["recommended_pcr"])
+        self.assertEqual(missing["reason"], "NO_CAMERA_COORDINATES")
+
+    def test_hotlist_match_creates_incident_with_vehicle_and_trajectory_links(self):
+        self.add_pcr("PCR02", 23.0330, 72.5240, "AVAILABLE")
+        self.add_hotlist()
+        event,_ = persist_plate_event(dict(camera_id="CAM02", plate_text="GJ01AB1234",
+                                           confidence=.95, status="ok"), window_seconds=0)
+        incidents = self.client.get("/api/incidents").json()
+        self.assertEqual(incidents["total"], 1)
+        incident = incidents["items"][0]
+        self.assertEqual(incident["hotlist_alert_id"], self.client.get("/api/hotlist-alerts").json()["items"][0]["id"])
+        self.assertEqual(incident["plate_text"], "GJ01AB1234")
+        self.assertEqual(incident["global_vehicle_id"], event.vehicle_id)
+        self.assertEqual(incident["recommended_pcr_id"], "PCR02")
+        self.assertEqual(incident["pcr_location_status"], "LIVE")
+        self.assertEqual(incident["recommendation_status"], "DISPATCH_RECOMMENDED")
+        self.assertIn(f"/api/vehicles/{event.vehicle_id}/trajectory", incident["trajectory_reference"])
+        self.assertIn(f"/api/vehicles/{event.vehicle_id}/investigation", incident["investigation_reference"])
+        investigation = self.client.get(incident["investigation_reference"]).json()
+        self.assertEqual(investigation["summary"]["global_vehicle_id"], event.vehicle_id)
+
+    def test_duplicate_incident_prevention_and_invalid_ocr_safety(self):
+        self.add_pcr("PCR02", 23.0330, 72.5240, "AVAILABLE")
+        self.add_hotlist()
+        values = dict(camera_id="CAM02", plate_text="GJ01AB1234", confidence=.95, status="ok")
+        first,_ = persist_plate_event(values)
+        persist_plate_event(values)
+        with SessionLocal() as db:
+            alert = db.query(HotlistAlert).filter_by(event_id=first.id).one()
+            self.assertEqual(db.query(EnforcementIncident).filter_by(hotlist_alert_id=alert.id).count(), 1)
+        self.add_hotlist(plate_text="GJ01AB5678")
+        persist_plate_event(dict(camera_id="CAM01", plate_text="GJ01AB5678",
+                                 confidence=.65, status="PENDING_REVIEW"), window_seconds=0)
+        alerts = self.client.get("/api/hotlist-alerts").json()
+        self.assertEqual(alerts["total"], 2)
+        self.assertEqual(self.client.get("/api/incidents").json()["total"], 1)
+        persist_plate_event(dict(camera_id="CAM03", plate_text="D", confidence=.99, status="ok"), window_seconds=0)
+        self.assertEqual(self.client.get("/api/incidents").json()["total"], 1)
+
+    def test_incident_status_update_and_hotlist_acknowledgement_link(self):
+        self.add_pcr("PCR02", 23.0330, 72.5240, "AVAILABLE")
+        self.add_hotlist()
+        persist_plate_event(dict(camera_id="CAM02", plate_text="GJ01AB1234",
+                                 confidence=.95, status="ok"), window_seconds=0)
+        incident = self.client.get("/api/incidents").json()["items"][0]
+        updated = self.client.post(f"/api/incidents/{incident['incident_id']}/status",
+                                   json={"status":"ACKNOWLEDGED", "updated_by":"tester"})
+        self.assertEqual(updated.status_code, 200, updated.text)
+        self.assertEqual(updated.json()["status"], "ACKNOWLEDGED")
+        self.assertEqual(self.client.post(f"/api/incidents/{incident['incident_id']}/status",
+                                          json={"status":"DISPATCHED"}).status_code, 422)
+        alert_id = incident["hotlist_alert_id"]
+        with SessionLocal() as db:
+            db.get(EnforcementIncident, incident["incident_id"]).status = "DISPATCH_RECOMMENDED"
+            db.commit()
+        ack = self.client.post(f"/api/hotlist-alerts/{alert_id}/acknowledge").json()
+        self.assertIsNotNone(ack["acknowledged_at"])
+        self.assertEqual(self.client.get(f"/api/incidents/{incident['incident_id']}").json()["status"], "ACKNOWLEDGED")
+
+    def test_law_enforcement_websocket_event(self):
+        from app.main import event_writer
+        self.add_pcr("PCR02", 23.0330, 72.5240, "AVAILABLE")
+        self.add_hotlist()
+        with self.client.websocket_connect("/ws/events") as socket:
+            socket.receive_json()
+            event_writer.enqueue_from_thread(dict(camera_id="CAM02", plate_text="GJ01AB1234",
+                                                  confidence=.95, status="ok"))
+            messages = [socket.receive_json(), socket.receive_json()]
+        types = {message["type"] for message in messages}
+        self.assertIn("hotlist_alert", types)
+        self.assertIn("law_enforcement_alert", types)
+        law = next(message for message in messages if message["type"] == "law_enforcement_alert")
+        self.assertEqual(law["recommended_pcr_id"], "PCR02")
+        self.assertEqual(law["incident"]["vehicle_id"], law["vehicle_id"])
 
     def add_hotlist(self, **overrides):
         body = dict(plate_text="GJ01AB1234",reason="Reported stolen",reference="TEST-1",category="stolen")

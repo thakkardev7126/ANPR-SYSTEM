@@ -20,12 +20,14 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.database import get_db, PlateEvent, Camera, Base, engine, AsyncPlateEventWriter, VehicleMatchCandidate, VehicleAnomaly, PlateSuspicionEvent, RouteAnomalyEvent
+from app.database import get_db, PlateEvent, Camera, Base, engine, AsyncPlateEventWriter, VehicleMatchCandidate, VehicleAnomaly, PlateSuspicionEvent, RouteAnomalyEvent, EnforcementIncident
 from app.database import DATABASE_PATH, DATABASE_URL
 from app.database import SessionLocal, backfill_vehicle_ids, ensure_vehicle_for_event, plate_similarity_score, persist_plate_event
 from app.database import HotlistAlert, HotlistNotification
 from app.hotlist import match_event, alert_payload
 from app.hotlist_api import router as hotlist_router
+from app.enforcement import incident_for_alert_payload, seed_demo_pcr_vehicles
+from app.enforcement_api import router as enforcement_router
 from app.image_quality import padded_plate_crop, bbox_frame_edges, assess_quality, PartialPlateHistory
 from app.location import resolve_location, camera_location, valid_coordinates, time_window, iso_utc
 from app.anpr_pipeline import (
@@ -133,6 +135,7 @@ async def lifespan(_app):
 
 app = FastAPI(title="City-Wide ANPR Trajectory Tracking — Demo API", lifespan=lifespan)
 app.include_router(hotlist_router)
+app.include_router(enforcement_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -145,6 +148,7 @@ app.add_middleware(
 Base.metadata.create_all(bind=engine)
 seed_cameras()
 with SessionLocal() as _startup_db:
+    seed_demo_pcr_vehicles(_startup_db)
     backfill_vehicle_ids(_startup_db)
 
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
@@ -428,9 +432,31 @@ async def publish_hotlist_notifications(cursor):
             cursor, alerts = await asyncio.to_thread(hotlist_notifications_after, cursor)
             for alert in alerts:
                 await event_hub.broadcast({"type": "hotlist_alert", "alert": alert})
+                incident = await asyncio.to_thread(_incident_payload_for_alert, alert["id"])
+                if incident:
+                    await event_hub.broadcast({
+                        "type": "law_enforcement_alert",
+                        "alert_id": alert["id"],
+                        "incident_id": incident["incident_id"],
+                        "plate_text": incident["plate_text"],
+                        "camera_id": incident["camera_id"],
+                        "vehicle_id": incident["vehicle_id"],
+                        "global_vehicle_id": incident["global_vehicle_id"],
+                        "recommended_pcr_id": incident["recommended_pcr_id"],
+                        "distance_meters": incident["distance_meters"],
+                        "pcr_location_status": incident["pcr_location_status"],
+                        "incident_status": incident["status"],
+                        "timestamp": incident["detected_at"],
+                        "incident": incident,
+                    })
         except Exception:
             logging.exception("Hotlist notification delivery failed; retrying")
         await asyncio.sleep(.5)
+
+
+def _incident_payload_for_alert(alert_id):
+    with SessionLocal() as db:
+        return incident_for_alert_payload(db, alert_id)
 
 
 def is_review_status(status):
@@ -663,8 +689,17 @@ async def _create_scan_event(db, camera_id, filepath, filename, persist_unreadab
             event, duplicate = await asyncio.to_thread(persist_plate_event, values)
             payload.update(_event_payload(event, cam.label, filename), duplicate=duplicate)
             with SessionLocal() as alert_db:
-                payload["hotlist_alerts"] = [alert_payload(a) for a in alert_db.query(HotlistAlert)
-                    .filter(HotlistAlert.event_id == event.id, HotlistAlert.match_status != "retracted")]
+                payload["hotlist_alerts"] = []
+                for alert in alert_db.query(HotlistAlert).filter(
+                    HotlistAlert.event_id == event.id,
+                    HotlistAlert.match_status != "retracted",
+                ):
+                    item = alert_payload(alert)
+                    incident = incident_for_alert_payload(alert_db, alert.id)
+                    if incident:
+                        item["incident_id"] = incident["incident_id"]
+                        item["enforcement_incident"] = incident
+                    payload["hotlist_alerts"].append(item)
         payload.update(detection_id=detection_id, bbox=best.get("bbox"),
                        raw_ocr_candidates=candidates, raw_text=metadata["raw_text"],
                        crop_image_path=metadata["crop_image_path"],
@@ -1139,6 +1174,7 @@ async def clear_events(db: Session = Depends(get_db)):
     deleted_events = len(events)
     # Keep alert snapshots without references to IDs SQLite may reuse after a clear.
     db.query(HotlistAlert).update({HotlistAlert.event_id: None}, synchronize_session=False)
+    db.query(EnforcementIncident).update({EnforcementIncident.event_id: None}, synchronize_session=False)
     db.query(RouteAnomalyEvent).delete(synchronize_session=False)
     db.query(PlateSuspicionEvent).delete(synchronize_session=False)
     db.query(VehicleAnomaly).delete(synchronize_session=False)

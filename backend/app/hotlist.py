@@ -52,6 +52,9 @@ def match_event(db, event):
     alert = next((a for a in existing if a.hotlist_id == entry.id), None)
     if alert:
         if alert.match_status == status:
+            if status == "matched":
+                from app.enforcement import ensure_incident_for_alert
+                ensure_incident_for_alert(db, alert)
             return
         alert.match_status = status
         alert.confidence = event.confidence or 0
@@ -65,4 +68,8 @@ def match_event(db, event):
             lat=lat, lng=lng, category=entry.category, reason=entry.reason, reference=entry.reference,
             confidence=event.confidence or 0, match_status=status, seen_at=event.timestamp)
         db.add(alert)
+    if status == "matched":
+        db.flush()
+        from app.enforcement import ensure_incident_for_alert
+        ensure_incident_for_alert(db, alert)
     notify(db, alert)

@@ -68,6 +68,11 @@
   .search-row button { padding:9px 12px; background:var(--accent); color:var(--text); border:0; border-radius:7px; font-weight:700; cursor:pointer; }
   .search-results { display:flex; flex-direction:column; gap:8px; margin-top:10px; }
   .search-hit { border:1px solid var(--border); border-radius:8px; padding:10px; display:flex; justify-content:space-between; gap:12px; }
+  .incident-item { border-color:rgba(217,83,79,0.58); }
+  .incident-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+  .incident-actions button { padding:8px 10px; background:var(--accent); color:var(--text); border:0; border-radius:7px; cursor:pointer; font:inherit; font-size:12px; }
+  .incident-actions button[data-status="ACKNOWLEDGED"] { background:var(--warn); color:#141821; font-weight:700; }
+  .incident-note { color:var(--muted); font-size:11px; line-height:1.45; grid-column:1 / -1; }
   @media (max-width: 720px) { .search-row { grid-template-columns:1fr 1fr; } }
   @media (max-width: 520px) { .review-item { grid-template-columns:1fr; } .review-item img { width:100%; } }
   @media (max-width: 520px) { .search-row:has(input[type=datetime-local]) { grid-template-columns:1fr; } }
@@ -122,6 +127,20 @@
     <h2>Urban traffic analytics</h2>
     <div id="trafficAnalytics" class="review-list">
       <div class="empty">Traffic analytics will appear after observations are available.</div>
+    </div>
+    <h2>Law Enforcement / PCR Alerts</h2>
+    <div id="incidentList" class="review-list">
+      <div class="empty">No active hotlist incidents.</div>
+    </div>
+    <div class="search-wrap" aria-label="Demo PCR GPS">
+      <div class="incident-note">Demo PCR GPS uses seeded or manually updated patrol locations. Recommendations are distance-based and do not confirm dispatch, interception, or police control-room integration.</div>
+      <form id="pcrLocationForm" class="search-row" style="margin-top:10px">
+        <label>PCR <select id="pcrSelect"></select></label>
+        <label>Latitude <input id="pcrLat" type="number" step="any" min="-90" max="90"></label>
+        <label>Longitude <input id="pcrLng" type="number" step="any" min="-180" max="180"></label>
+        <button type="submit">Update Demo GPS</button>
+        <span id="pcrStatus" role="status"></span>
+      </form>
     </div>
     <h2>Review queue</h2>
     <div id="reviewList" class="review-list">
@@ -205,7 +224,10 @@ let streamConnected = false;
 let leafletMap = null;
 let cameraLayer = null;
 let routeLayer = null;
+let enforcementLayer = null;
 let trafficHeatmap = [];
+let lawIncidents = [];
+let pcrVehicles = [];
 const liveFrame = document.getElementById("liveFrame");
 const overlay = document.getElementById("overlay");
 const streamEmpty = document.getElementById("streamEmpty");
@@ -229,6 +251,7 @@ function connectEventSocket() {
   eventSocket = new ANPRSocket(`${wsBase}/ws/events`, {
     onMessage: data => {
       if (["event_created", "events_created", "event_corrected", "events_cleared", "match_reviewed"].includes(data.type)) refresh();
+      if (data.type === "law_enforcement_alert") loadLawEnforcementIncidents();
     },
   });
 }
@@ -255,6 +278,7 @@ function initLeafletMap() {
   }).addTo(leafletMap);
   cameraLayer = L.layerGroup().addTo(leafletMap);
   routeLayer = L.layerGroup().addTo(leafletMap);
+  enforcementLayer = L.layerGroup().addTo(leafletMap);
 }
 
 function renderMap(hops) {
@@ -298,6 +322,50 @@ function renderMap(hops) {
   }
 
   if (bounds.length) leafletMap.fitBounds(bounds, { padding: [28, 28], maxZoom: 15 });
+}
+
+function renderLawEnforcementMap(items) {
+  initLeafletMap();
+  if (!leafletMap || !enforcementLayer) return;
+  enforcementLayer.clearLayers();
+  const bounds = [];
+  (items || []).slice(0, 6).forEach(item => {
+    const camera = item.camera || {};
+    const pcr = item.recommended_pcr || {};
+    const hasCamera = camera.latitude != null && camera.longitude != null;
+    const hasPcr = pcr.latitude != null && pcr.longitude != null;
+    if (hasCamera) {
+      L.circleMarker([camera.latitude, camera.longitude], {
+        radius: 10,
+        color: "#d9534f",
+        fillColor: "#d9534f",
+        fillOpacity: 0.92,
+        weight: 2,
+      }).bindPopup(`<strong>Hotlist detection</strong><br>${item.plate_text}<br>${item.camera_id}<br>${item.status}`).addTo(enforcementLayer);
+      bounds.push([camera.latitude, camera.longitude]);
+    }
+    if (hasPcr) {
+      L.circleMarker([pcr.latitude, pcr.longitude], {
+        radius: 8,
+        color: "#d9a441",
+        fillColor: "#d9a441",
+        fillOpacity: 0.85,
+        weight: 2,
+      }).bindPopup(`<strong>Recommended PCR</strong><br>${pcr.pcr_id}<br>${item.distance_km ?? "n/a"} km<br>${item.pcr_location_status}`).addTo(enforcementLayer);
+      bounds.push([pcr.latitude, pcr.longitude]);
+    }
+    if (hasCamera && hasPcr) {
+      L.polyline([[camera.latitude, camera.longitude], [pcr.latitude, pcr.longitude]], {
+        color: "#d9a441",
+        weight: 2,
+        opacity: 0.75,
+        dashArray: "6 6",
+      }).bindPopup("Approximate straight-line distance, not a road route.").addTo(enforcementLayer);
+    }
+  });
+  if (bounds.length && !(selectedPlate && routeLayer?.getLayers().length)) {
+    leafletMap.fitBounds(bounds, { padding: [28, 28], maxZoom: 15 });
+  }
 }
 
 async function loadRoadNetwork() {
@@ -366,6 +434,84 @@ async function loadTrafficAnalytics() {
       </div>
     </div>
   `;
+}
+
+function statusBadge(value) {
+  const status = String(value || "").toUpperCase();
+  if (["DISMISSED", "OFFLINE", "STALE", "UNKNOWN", "NO_AVAILABLE_PCR"].includes(status)) return "bad";
+  if (["NEW", "BUSY", "DISPATCH_RECOMMENDED", "ACKNOWLEDGED"].includes(status)) return "warn";
+  return "ok";
+}
+
+function renderPcrSelector() {
+  const select = document.getElementById("pcrSelect");
+  if (!select) return;
+  select.innerHTML = pcrVehicles.map(pcr => `<option value="${pcr.pcr_id}">${pcr.pcr_id} — ${pcr.status}</option>`).join("");
+  const selected = pcrVehicles.find(pcr => pcr.pcr_id === select.value) || pcrVehicles[0];
+  if (selected) {
+    select.value = selected.pcr_id;
+    document.getElementById("pcrLat").value = selected.latitude ?? "";
+    document.getElementById("pcrLng").value = selected.longitude ?? "";
+  }
+}
+
+async function loadPcrVehicles() {
+  const data = await fetchJSON("/api/pcr");
+  pcrVehicles = data.items || [];
+  renderPcrSelector();
+}
+
+async function loadLawEnforcementIncidents() {
+  try { await loadPcrVehicles(); } catch (error) {}
+  const data = await fetchJSON("/api/incidents?limit=6");
+  lawIncidents = data.items || [];
+  const list = document.getElementById("incidentList");
+  const active = lawIncidents.filter(item => item.status !== "DISMISSED");
+  if (!active.length) {
+    list.innerHTML = `<div class="empty">No active hotlist incidents.</div>`;
+    renderLawEnforcementMap([]);
+    return;
+  }
+  list.innerHTML = active.map(item => {
+    const pcr = item.recommended_pcr || {};
+    const distance = item.distance_km != null ? `${Number(item.distance_km).toFixed(2)} km` : "No distance";
+    const pcrLabel = item.recommended_pcr_id
+      ? `${item.recommended_pcr_id} · ${distance} · GPS ${item.pcr_location_status}`
+      : `${item.recommendation_status.replaceAll("_", " ")} · ${item.recommendation_reason}`;
+    return `
+      <div class="review-item incident-item" data-incident-id="${item.incident_id}" data-plate="${item.plate_text}" data-vehicle-id="${item.global_vehicle_id || ""}">
+        <div class="review-body" style="grid-column:1 / -1">
+          <div class="plate">${item.plate_text} · ${item.category || "hotlist"}</div>
+          <div class="meta">${item.camera_label || item.camera_id} · ${new Date(item.detected_at).toLocaleString()} · ${item.global_vehicle_id || "No Global Vehicle ID"}</div>
+          <div class="meta">Recommended PCR: ${pcrLabel}</div>
+          <div class="meta">Distance-based recommendation only. ${pcr.demo_only ? "Simulated PCR location." : ""}</div>
+          <div class="incident-actions">
+            <span class="badge ${statusBadge(item.status)}">${item.status.replaceAll("_", " ")}</span>
+            ${item.status !== "ACKNOWLEDGED" ? `<button type="button" data-status="ACKNOWLEDGED">Acknowledge incident</button>` : ""}
+            <button type="button" data-open-investigation="true">Open investigation</button>
+          </div>
+        </div>
+      </div>
+    `;
+  }).join("");
+  list.querySelectorAll("button[data-status]").forEach(button => {
+    button.addEventListener("click", async () => {
+      const item = button.closest(".incident-item");
+      const response = await fetch(`${API_BASE}/api/incidents/${item.dataset.incidentId}/status`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: button.dataset.status, updated_by: "dashboard" }),
+      });
+      if (response.ok) await loadLawEnforcementIncidents();
+    });
+  });
+  list.querySelectorAll("button[data-open-investigation]").forEach(button => {
+    button.addEventListener("click", () => {
+      const item = button.closest(".incident-item");
+      selectVehicle(item.dataset.plate, item.dataset.vehicleId || undefined);
+    });
+  });
+  renderLawEnforcementMap(active);
 }
 
 function formatDuration(seconds) {
@@ -972,6 +1118,7 @@ async function refresh() {
   try { await loadStats(); } catch (error) {}
   try { await loadRoadNetwork(); } catch (error) {}
   try { await loadTrafficAnalytics(); } catch (error) {}
+  try { await loadLawEnforcementIncidents(); } catch (error) {}
   try { await loadReviewQueue(); } catch (error) {}
   try { await loadMatchQueue(); } catch (error) {}
   try { await loadAnomalyQueue(); } catch (error) {}
@@ -1019,6 +1166,31 @@ document.getElementById("locationForm").addEventListener("submit", async event =
     status.textContent = lat === "" ? "Location unknown" : "Location saved";
     await refresh();
   } catch (error) { status.textContent = error.message; }
+});
+document.getElementById("pcrSelect").addEventListener("change", event => {
+  const selected = pcrVehicles.find(pcr => pcr.pcr_id === event.target.value);
+  document.getElementById("pcrLat").value = selected?.latitude ?? "";
+  document.getElementById("pcrLng").value = selected?.longitude ?? "";
+});
+document.getElementById("pcrLocationForm").addEventListener("submit", async event => {
+  event.preventDefault();
+  const pcrId = document.getElementById("pcrSelect").value;
+  const status = document.getElementById("pcrStatus");
+  if (!pcrId) { status.textContent = "No PCR selected."; return; }
+  const lat = Number(document.getElementById("pcrLat").value);
+  const lng = Number(document.getElementById("pcrLng").value);
+  try {
+    const response = await fetch(`${API_BASE}/api/pcr/${encodeURIComponent(pcrId)}/location`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ latitude: lat, longitude: lng, timestamp: new Date().toISOString() }),
+    });
+    if (!response.ok) throw new Error("Demo PCR GPS not saved");
+    status.textContent = "Simulated PCR location updated";
+    await loadLawEnforcementIncidents();
+  } catch (error) {
+    status.textContent = error.message;
+  }
 });
 document.getElementById("searchStart").addEventListener("input", event => {
   document.getElementById("searchMinutes").disabled = Boolean(event.target.value);
