@@ -18,7 +18,7 @@ from app.travel_time import calculate_travel_segment, speed_summary
 
 
 VALID_BUCKETS = {"hour", "day"}
-LANE_STATUS = "not_configured"
+LANE_STATUS = "NO_DATA"
 
 
 def _float_env(name, default):
@@ -382,8 +382,9 @@ def congestion_for_road(row):
     volume = row.get("movement_count") or 0
     if avg_speed is None:
         return {
-            "status": "UNAVAILABLE",
+            "status": "NO_DATA",
             "score": 0.0,
+            "label": "Insufficient road-speed data",
             "explanation": "No valid camera-to-camera speed segments are available for this road connection.",
             "evidence": {"movement_count": volume, "valid_speed_segment_count": row.get("valid_speed_segment_count", 0)},
         }
@@ -492,12 +493,14 @@ def _camera_congestion_status(camera_id, db, start, end):
         return "WATCH"
     if statuses:
         return "NORMAL"
-    return "UNAVAILABLE"
+    return "NO_DATA"
 
 
 def lane_metrics():
     return {
         "status": LANE_STATUS,
+        "available": False,
+        "label": "Lane analysis not configured",
         "items": [],
         "explanation": "Lane-level IDs, lane bounding boxes, and reliable per-lane tracking are not configured in the current project.",
     }
@@ -525,7 +528,10 @@ def traffic_summary(db, start=None, end=None):
         "busiest_camera": busiest_camera,
         "busiest_road": busiest_road,
         "average_road_speed_kmh": round(sum(valid_road_speeds) / len(valid_road_speeds), 3) if valid_road_speeds else None,
-        "lane_analysis": lane_metrics()["status"],
+        "average_road_speed_available": bool(valid_road_speeds),
+        "lane_analysis": None,
+        "lane_analysis_available": False,
+        "lane_analysis_label": None,
         "metric_note": "Traffic analytics are derived from persisted ANPR observations and Global Vehicle IDs.",
         "time_window": {"start": _safe_iso(start), "end": _safe_iso(end)},
     }

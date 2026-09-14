@@ -1,5 +1,4 @@
 (() => {
-  const base = location.port === "5500" ? `${location.protocol}//${location.hostname}:8000` : location.origin;
   const $ = id => document.getElementById(id);
   let editing = null, entryOffset = 0, alertOffset = 0, entryGeneration = 0, alertGeneration = 0;
   const size = 25;
@@ -11,10 +10,25 @@
     return element;
   };
   async function api(path, options = {}) {
-    const response = await fetch(base + path, {...options, signal:AbortSignal.timeout(8000)});
-    const data = await response.json();
+    const response = await ANPRAuth.request(path, options, 8000);
+    const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(typeof data.detail === "string" ? data.detail : "Check the plate number and required fields.");
     return data;
+  }
+  function applyAuthUI(user) {
+    $("hotlistMain").hidden = !user;
+    $("sessionSummary").innerHTML = user
+      ? `${user.username} <span class="auth-role">${user.role.replaceAll("_", " ")}</span>`
+      : "Sign in to view protected hotlist data";
+    $("loginUsername").hidden = Boolean(user);
+    $("loginPassword").hidden = Boolean(user);
+    $("loginBtn").hidden = Boolean(user);
+    $("logoutBtn").hidden = !user;
+  }
+  async function startAuthenticated() {
+    if (!ANPRAuth.isAuthenticated()) return;
+    applyAuthUI(ANPRAuth.currentUser);
+    await Promise.allSettled([entries(), alerts()]);
   }
   const date = value => value ? new Date(value).toLocaleString() : "No expiry";
   function pager(prefix, offset, total) {
@@ -125,6 +139,21 @@
   $("alertsNext").onclick = () => { alertOffset+=size; alerts(); };
   let refreshTimer;
   window.addEventListener("hotlist-update", () => { clearTimeout(refreshTimer); refreshTimer=setTimeout(alerts,250); });
-  entries();
-  alerts();
+  $("loginBtn").onclick = async () => {
+    try {
+      await ANPRAuth.login($("loginUsername").value.trim(), $("loginPassword").value);
+      await startAuthenticated();
+    } catch {
+      $("sessionSummary").textContent = "Login failed";
+    }
+  };
+  $("logoutBtn").onclick = async () => {
+    await ANPRAuth.logout();
+    applyAuthUI(null);
+    $("entryRows").replaceChildren();
+    $("alertRows").replaceChildren();
+  };
+  ANPRAuth.onChange(applyAuthUI);
+  applyAuthUI(null);
+  ANPRAuth.loadSession().then(startAuthenticated).catch(() => applyAuthUI(null));
 })();

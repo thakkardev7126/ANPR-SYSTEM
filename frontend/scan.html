@@ -42,14 +42,32 @@
   .auto-actions { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:10px; }
   .auto-actions button { padding:11px 8px; border-radius:8px; border:1px solid #2b2f38; background:#0f1115; color:var(--text); font-size:14px; cursor:pointer; }
   .auto-actions button:disabled { opacity:0.45; cursor:not-allowed; }
+  .last-scan { margin:10px 0 12px; padding:10px 12px; border-radius:10px; background:#123c2a; border:1px solid #1f6e46; }
+  .last-scan .label { margin:0 0 2px; color:var(--muted); font-size:12px; }
+  .last-scan .plate { margin:0; font-size:22px; }
+  .auth-card { background:var(--card); border-radius:14px; padding:16px; width:100%; max-width:420px; margin-bottom:16px; display:grid; gap:10px; }
+  .auth-row { display:grid; grid-template-columns:1fr 1fr auto; gap:8px; }
+  .auth-row input { min-width:0; padding:10px; border-radius:8px; border:1px solid #2b2f38; background:#0f1115; color:var(--text); }
+  .auth-row button { padding:10px 12px; border-radius:8px; border:0; background:var(--accent); color:white; cursor:pointer; }
+  .auth-row button.secondary { background:#0f1115; border:1px solid #2b2f38; }
+  @media(max-width:520px) { .auth-row { grid-template-columns:1fr; } }
 </style>
 </head>
 <body data-hotlist-scope="camera">
   <h1>ANPR field scanner</h1>
   <a class="hotlist-link" href="hotlist.html">Hotlist &amp; alerts</a>
   <div class="sub">Select a camera node, start auto scan, then place a number plate in front of this phone.</div>
+  <div class="auth-card" id="authGate">
+    <div class="meta" id="sessionSummary">Checking session...</div>
+    <div class="auth-row">
+      <input id="loginUsername" autocomplete="username" placeholder="admin_demo">
+      <input id="loginPassword" type="password" autocomplete="current-password" placeholder="Demo password">
+      <button id="loginBtn" type="button">Login</button>
+      <button id="logoutBtn" type="button" class="secondary" hidden>Logout</button>
+    </div>
+  </div>
 
-  <div class="card">
+  <div class="card" id="scannerCard" hidden>
     <label for="cameraSelect">Camera identity</label>
     <select id="cameraSelect"></select>
 
@@ -61,6 +79,11 @@
       </div>
       <canvas id="autoCanvas" hidden></canvas>
       <div class="meta" id="autoStatus">Auto scan stopped</div>
+      <div id="lastScanCard" class="last-scan" hidden>
+        <div class="label">Last scanned</div>
+        <div class="plate" id="lastScanPlate">—</div>
+        <div class="meta" id="lastScanMeta"></div>
+      </div>
       <div class="auto-actions">
         <button id="startAutoBtn" type="button">Start auto scan</button>
         <button id="stopAutoBtn" type="button" disabled>Stop</button>
@@ -103,11 +126,12 @@
     </div>
   </div>
 
-  <div class="log">
+  <div class="log" id="scanLog" hidden>
     <div class="meta" style="margin-bottom:6px;">This phone's scan log</div>
     <div id="logList"></div>
   </div>
 
+<script src="auth.js"></script>
 <script src="reconnecting-socket.js"></script>
 <script src="hotlist-alerts.js"></script>
 <script>
@@ -146,8 +170,10 @@ let snapshotTimer = null;
 let streamConnected = false;
 let autoStream = null;
 let autoTimer = null;
-let autoInFlight = false;
+let isProcessingFrame = false;
 let autoCooldownUntil = 0;
+let lastFrameCapturedAt = 0;
+const AUTO_FRAME_MIN_DELAY_MS = 300;
 const liveFrame = document.getElementById("liveFrame");
 const overlay = document.getElementById("overlay");
 const streamStatus = document.getElementById("streamStatus");
@@ -156,6 +182,9 @@ const autoVideo = document.getElementById("autoVideo");
 const autoCanvas = document.getElementById("autoCanvas");
 const autoEmpty = document.getElementById("autoEmpty");
 const autoStatus = document.getElementById("autoStatus");
+const lastScanCard = document.getElementById("lastScanCard");
+const lastScanPlate = document.getElementById("lastScanPlate");
+const lastScanMeta = document.getElementById("lastScanMeta");
 const startAutoBtn = document.getElementById("startAutoBtn");
 const stopAutoBtn = document.getElementById("stopAutoBtn");
 
@@ -181,10 +210,25 @@ function renderCameraOptions(cams) {
 }
 
 function fetchWithTimeout(url, options = {}, timeoutMs = 3500) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(new DOMException("Request timed out", "TimeoutError")), timeoutMs);
-  return fetch(url.startsWith("/") ? apiUrl(url) : url, { ...options, signal: controller.signal })
-    .finally(() => clearTimeout(timeout));
+  return ANPRAuth.request(url.startsWith("/") ? url : url.replace(API_ORIGIN, ""), options, timeoutMs);
+}
+
+function applyAuthUI(user) {
+  document.getElementById("scannerCard").hidden = !user;
+  document.getElementById("scanLog").hidden = !user;
+  document.getElementById("sessionSummary").textContent = user
+    ? `${user.username} - ${user.role.replaceAll("_", " ")}`
+    : "Sign in to use protected camera APIs.";
+  document.getElementById("loginUsername").hidden = Boolean(user);
+  document.getElementById("loginPassword").hidden = Boolean(user);
+  document.getElementById("loginBtn").hidden = Boolean(user);
+  document.getElementById("logoutBtn").hidden = !user;
+  if (!user) {
+    cameraSocket?.close();
+    cameraSocket = null;
+    clearInterval(snapshotTimer);
+    stopAutoScan();
+  }
 }
 
 function drawOverlay(result) {
@@ -203,6 +247,7 @@ function drawOverlay(result) {
 }
 
 function connectLiveCamera(cameraId) {
+  if (!ANPRAuth.isAuthenticated()) return;
   if (cameraSocket) cameraSocket.close();
   streamConnected = false;
   liveFrame.style.display = "none";
@@ -234,10 +279,12 @@ function connectLiveCamera(cameraId) {
       }
       drawOverlay(data.result);
     },
+    shouldReconnect: () => ANPRAuth.isAuthenticated(),
   });
 }
 
 async function loadCameras() {
+  if (!ANPRAuth.isAuthenticated()) return;
   renderCameraOptions(DEMO_CAMERAS);
   if (cameraSelect.value) connectLiveCamera(cameraSelect.value);
   try {
@@ -250,7 +297,30 @@ async function loadCameras() {
     streamStatus.textContent = "Backend not ready; using demo camera list";
   }
 }
-loadCameras();
+
+async function startAuthenticatedScanner() {
+  applyAuthUI(ANPRAuth.currentUser);
+  await loadCameras();
+}
+
+document.getElementById("loginBtn").addEventListener("click", async () => {
+  try {
+    await ANPRAuth.login(
+      document.getElementById("loginUsername").value.trim(),
+      document.getElementById("loginPassword").value,
+    );
+    await startAuthenticatedScanner();
+  } catch {
+    document.getElementById("sessionSummary").textContent = "Login failed";
+  }
+});
+document.getElementById("logoutBtn").addEventListener("click", async () => {
+  await ANPRAuth.logout();
+  applyAuthUI(null);
+});
+ANPRAuth.onChange(applyAuthUI);
+applyAuthUI(null);
+ANPRAuth.loadSession().then(user => { if (user) startAuthenticatedScanner(); }).catch(() => applyAuthUI(null));
 
 if (!window.isSecureContext && !isLocalhost()) {
   autoStatus.textContent = "Auto camera needs HTTPS on phones. Use the HTTPS demo URL, or use manual photo capture.";
@@ -280,6 +350,13 @@ function appendLog(itemData) {
   item.className = "log-item";
   item.innerHTML = `<span>${itemData.plate_text || "—"}</span><span>${itemData.filename || "photo"}</span>`;
   logList.prepend(item);
+}
+
+function showLastScanned(item) {
+  if (!item?.plate_text) return;
+  lastScanPlate.textContent = item.plate_text;
+  lastScanMeta.textContent = `${cameraSelect.value} · ${Math.round((item.confidence || 0) * 100)}% · ${new Date().toLocaleTimeString()}`;
+  lastScanCard.hidden = false;
 }
 
 function normalizeScanResult(data, filename) {
@@ -449,7 +526,7 @@ async function startAutoScan() {
     startAutoBtn.disabled = true;
     stopAutoBtn.disabled = false;
     autoStatus.textContent = "Auto scan running";
-    autoTimer = setInterval(captureAutoFrame, 500);
+    autoTimer = setInterval(captureAutoFrame, AUTO_FRAME_MIN_DELAY_MS);
     setTimeout(captureAutoFrame, 600);
   } catch (error) {
     autoStatus.textContent = "Could not open phone camera. Allow camera permission and use HTTPS or localhost.";
@@ -467,24 +544,28 @@ function stopAutoScan() {
   startAutoBtn.disabled = false;
   stopAutoBtn.disabled = true;
   autoStatus.textContent = "Auto scan stopped";
+  isProcessingFrame = false;
 }
 
 function captureAutoFrame() {
+  const now = Date.now();
   if (
-    autoInFlight ||
+    isProcessingFrame ||
     !autoStream ||
-    Date.now() < autoCooldownUntil ||
+    now < autoCooldownUntil ||
+    now - lastFrameCapturedAt < AUTO_FRAME_MIN_DELAY_MS ||
     autoVideo.videoWidth <= 0 ||
     autoVideo.videoHeight <= 0
   ) return;
-  autoInFlight = true;
+  isProcessingFrame = true;
+  lastFrameCapturedAt = now;
   autoCanvas.width = autoVideo.videoWidth;
   autoCanvas.height = autoVideo.videoHeight;
   autoCanvas.getContext("2d").drawImage(autoVideo, 0, 0, autoCanvas.width, autoCanvas.height);
   autoStatus.textContent = "Scanning current frame...";
   autoCanvas.toBlob(async blob => {
     if (!blob) {
-      autoInFlight = false;
+      isProcessingFrame = false;
       return;
     }
     const file = new File([blob], `auto_${Date.now()}.jpg`, { type: "image/jpeg" });
@@ -492,6 +573,7 @@ function captureAutoFrame() {
       const data = await uploadFiles([file], "auto frames", "auto");
       const best = data.best;
       if (isAcceptedAutoDetection(best)) {
+        showLastScanned(best);
         autoStatus.textContent = `Detected ${best.plate_text} · waiting briefly`;
         autoCooldownUntil = Date.now() + 3000;
       } else {
@@ -500,7 +582,7 @@ function captureAutoFrame() {
     } catch (error) {
       autoStatus.textContent = `Auto upload failed: ${error.message || "check backend and WiFi"}`;
     } finally {
-      autoInFlight = false;
+      isProcessingFrame = false;
     }
   }, "image/jpeg", 0.82);
 }
@@ -528,7 +610,7 @@ correctBtn.addEventListener("click", async () => {
   }
 });
 window.addEventListener("pagehide", () => { cameraSocket?.close(); clearInterval(snapshotTimer); stopAutoScan(); });
-window.addEventListener("pageshow", event => { if (event.persisted && cameraSelect.value) connectLiveCamera(cameraSelect.value); });
+window.addEventListener("pageshow", event => { if (event.persisted && cameraSelect.value && ANPRAuth.isAuthenticated()) connectLiveCamera(cameraSelect.value); });
 </script>
 </body>
 </html>

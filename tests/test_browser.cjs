@@ -20,6 +20,10 @@ const pixel = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQ
       const hops = cameras.map((c,i) => ({...c,camera_label:c.label,event_id:i+1,
         timestamp:"2026-09-10T04:00:00Z",confidence:.94,status:"ok",plausible:true}));
       const json = data => ({contentType:"application/json",body:JSON.stringify(data)});
+      await page.route("**/api/auth/me", route=>route.fulfill(json({
+        user:{id:1,username:"admin_demo",role:"SYSTEM_ADMIN",active:true},
+        permissions:["*"]
+      })));
       await page.route("**/api/cameras", route=>route.fulfill(json(cameras)));
       await page.route("**/api/cameras/*/snapshot?*", route=>route.fulfill({contentType:"image/png",body:pixel}));
       await page.route("**/api/stats", route=>route.fulfill(json({total_scans:2,unique_vehicles:1,needs_review:0})));

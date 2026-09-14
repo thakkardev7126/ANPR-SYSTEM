@@ -13,6 +13,9 @@
   h2 { font-size:17px; margin:0; }
   nav { display:flex; gap:20px; }
   a { color:#a9d7ff; }
+  .auth-box { display:flex; align-items:center; gap:8px; flex-wrap:wrap; color:#b1b9c5; font-size:12px; }
+  .auth-box input { width:130px; }
+  .auth-role { color:#eef1f5; font-weight:700; }
   main { max-width:1200px; margin:auto; padding:28px; }
   section { margin-bottom:36px; min-width:0; }
   .toolbar { display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin:16px 0; }
@@ -47,8 +50,18 @@
 </style>
 </head>
 <body>
-<header><h1>Vehicle hotlist</h1><nav><a href="dashboard.html">Dashboard</a><a href="scan.html">Scanner</a></nav></header>
-<main>
+<header>
+  <h1>Vehicle hotlist</h1>
+  <div class="auth-box">
+    <span id="sessionSummary">Checking session...</span>
+    <input id="loginUsername" autocomplete="username" placeholder="admin_demo">
+    <input id="loginPassword" type="password" autocomplete="current-password" placeholder="Demo password">
+    <button id="loginBtn" type="button">Login</button>
+    <button id="logoutBtn" type="button" hidden>Logout</button>
+  </div>
+  <nav><a href="dashboard.html">Dashboard</a><a href="scan.html">Scanner</a></nav>
+</header>
+<main id="hotlistMain" hidden>
   <section aria-labelledby="entriesTitle">
     <div class="toolbar"><h2 id="entriesTitle">Registered plates</h2><button id="addEntry">Add plate</button></div>
     <div class="toolbar"><label>Plate search<input id="entrySearch" type="search" maxlength="120"></label><button id="searchEntries">Search</button></div>
@@ -76,6 +89,7 @@
     <div class="actions"><button id="cancelEntry" type="button" class="edit-button">Cancel</button><button id="saveEntry" type="submit">Save entry</button></div>
   </form>
 </dialog>
+<script src="auth.js"></script>
 <script src="reconnecting-socket.js"></script>
 <script src="hotlist-alerts.js"></script>
 <script src="hotlist.js"></script>

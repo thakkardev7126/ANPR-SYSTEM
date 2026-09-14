@@ -43,6 +43,13 @@ class Camera(Base):
     stream_type = Column(String, nullable=True)       # http | rtsp
     active = Column(Boolean, default=False, nullable=False)
     last_seen = Column(DateTime, nullable=True)
+    edge_device_id = Column(String(80), nullable=True, index=True)
+    edge_status = Column(String(20), nullable=False, default="OFFLINE", index=True)
+    edge_last_processed = Column(DateTime, nullable=True)
+    edge_config_json = Column(Text, nullable=True)
+    frames_sampled = Column(Integer, nullable=False, default=0)
+    observations_produced = Column(Integer, nullable=False, default=0)
+    processing_errors = Column(Integer, nullable=False, default=0)
 
 
 class CameraRoadConnection(Base):
@@ -72,6 +79,17 @@ class PlateEvent(Base):
     id = Column(Integer, primary_key=True, index=True)
     camera_id = Column(String, index=True)
     image_path = Column(String)
+    original_image_path = Column(String, nullable=True)
+    original_image_path_ciphertext = Column(Text, nullable=True)
+    original_image_path_nonce = Column(String(64), nullable=True)
+    original_image_path_key_version = Column(String(40), nullable=True)
+    privacy_image_path = Column(String, nullable=True)
+    privacy_status = Column(String, nullable=True)
+    privacy_metadata = Column(Text, nullable=True)
+    privacy_metadata_ciphertext = Column(Text, nullable=True)
+    privacy_metadata_nonce = Column(String(64), nullable=True)
+    privacy_metadata_key_version = Column(String(40), nullable=True)
+    privacy_processed_at = Column(DateTime, nullable=True)
     plate_text = Column(String, index=True, nullable=True)
     confidence = Column(Float, nullable=True)
     status = Column(String, default="processing")   # processing | ok | PENDING_REVIEW | failed
@@ -307,6 +325,178 @@ class EnforcementIncident(Base):
     updated_by = Column(String(80), nullable=True)
 
 
+class User(Base):
+    """Local demo user for Phase 8 RBAC."""
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True)
+    username = Column(String(80), nullable=False, unique=True, index=True)
+    password_hash = Column(String(255), nullable=False)
+    role = Column(String(40), nullable=False, index=True)
+    active = Column(Boolean, nullable=False, default=True, index=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+
+
+class AuditLog(Base):
+    """Append-only, hash-chained application audit record."""
+    __tablename__ = "audit_logs"
+
+    id = Column(Integer, primary_key=True)
+    audit_id = Column(String(36), nullable=False, unique=True, index=True)
+    timestamp = Column(DateTime, nullable=False, default=datetime.datetime.utcnow, index=True)
+    user_id = Column(Integer, nullable=True, index=True)
+    username = Column(String(80), nullable=True, index=True)
+    role = Column(String(40), nullable=True, index=True)
+    action = Column(String(80), nullable=False, index=True)
+    resource_type = Column(String(80), nullable=True, index=True)
+    resource_id = Column(String(120), nullable=True, index=True)
+    source = Column(Text, nullable=True)
+    success = Column(Boolean, nullable=False, default=True, index=True)
+    reason = Column(String(240), nullable=True)
+    details = Column(Text, nullable=True)
+    previous_hash = Column(String(64), nullable=False)
+    current_hash = Column(String(64), nullable=False)
+
+
+class EdgeDevice(Base):
+    """Logical edge agent/device feeding sampled ANPR metadata into the backend."""
+    __tablename__ = "edge_devices"
+
+    id = Column(Integer, primary_key=True)
+    edge_device_id = Column(String(80), nullable=False, unique=True, index=True)
+    label = Column(String(120), nullable=True)
+    status = Column(String(20), nullable=False, default="OFFLINE", index=True)
+    last_seen_at = Column(DateTime, nullable=True, index=True)
+    last_processed_at = Column(DateTime, nullable=True)
+    config_json = Column(Text, nullable=True)
+    credential_hash = Column(String(128), nullable=True)
+    credential_version = Column(String(40), nullable=True)
+    queue_mode = Column(String(30), nullable=False, default="local")
+    frames_sampled = Column(Integer, nullable=False, default=0)
+    observations_received = Column(Integer, nullable=False, default=0)
+    observations_processed = Column(Integer, nullable=False, default=0)
+    observations_failed = Column(Integer, nullable=False, default=0)
+    duplicate_observations = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+
+
+class EdgeObservation(Base):
+    """Idempotent edge observation envelope before/after central persistence."""
+    __tablename__ = "edge_observations"
+
+    id = Column(Integer, primary_key=True)
+    observation_id = Column(String(120), nullable=False, unique=True, index=True)
+    camera_id = Column(String, nullable=False, index=True)
+    edge_device_id = Column(String(80), nullable=False, index=True)
+    frame_id = Column(String(120), nullable=True)
+    sequence_number = Column(Integer, nullable=True)
+    capture_timestamp = Column(DateTime, nullable=False, index=True)
+    received_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow, index=True)
+    processing_started_at = Column(DateTime, nullable=True)
+    processing_completed_at = Column(DateTime, nullable=True)
+    status = Column(String(30), nullable=False, default="RECEIVED", index=True)
+    retry_count = Column(Integer, nullable=False, default=0)
+    max_retries = Column(Integer, nullable=False, default=3)
+    next_retry_at = Column(DateTime, nullable=True)
+    error_message = Column(String(500), nullable=True)
+    payload_json = Column(Text, nullable=False)
+    plate_event_id = Column(Integer, nullable=True, index=True)
+    queue_name = Column(String(80), nullable=True)
+    processing_latency_ms = Column(Float, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+
+
+class RetentionRun(Base):
+    """Manual retention lifecycle run for raw/high-resolution evidence."""
+    __tablename__ = "retention_runs"
+
+    id = Column(Integer, primary_key=True)
+    run_id = Column(String(36), nullable=False, unique=True, index=True)
+    dry_run = Column(Boolean, nullable=False, default=True, index=True)
+    policy_json = Column(Text, nullable=False)
+    result_json = Column(Text, nullable=False)
+    status = Column(String(30), nullable=False, default="completed", index=True)
+    started_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow, index=True)
+    completed_at = Column(DateTime, nullable=True)
+    actor = Column(String(80), nullable=True)
+
+
+class TrafficJunction(Base):
+    """Configured junction for Phase 10 signal recommendations."""
+    __tablename__ = "traffic_junctions"
+
+    id = Column(Integer, primary_key=True)
+    junction_id = Column(String(80), nullable=False, unique=True, index=True)
+    name = Column(String(160), nullable=False)
+    lat = Column(Float, nullable=True)
+    lng = Column(Float, nullable=True)
+    camera_ids_json = Column(Text, nullable=False, default="[]")
+    active = Column(Boolean, nullable=False, default=True, index=True)
+    controller_mode = Column(String(30), nullable=False, default="simulation")
+    controller_url = Column(String(500), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+
+
+class SignalPhase(Base):
+    """One configurable signal phase/movement for a junction."""
+    __tablename__ = "signal_phases"
+    __table_args__ = (UniqueConstraint("junction_id", "phase_id", name="uq_signal_phase_junction"),)
+
+    id = Column(Integer, primary_key=True)
+    phase_id = Column(String(80), nullable=False, index=True)
+    junction_id = Column(String(80), nullable=False, index=True)
+    movement = Column(String(120), nullable=False)
+    movement_camera_ids_json = Column(Text, nullable=False, default="[]")
+    min_green_seconds = Column(Integer, nullable=False, default=15)
+    max_green_seconds = Column(Integer, nullable=False, default=90)
+    yellow_seconds = Column(Integer, nullable=False, default=4)
+    all_red_seconds = Column(Integer, nullable=False, default=2)
+    current_state = Column(String(30), nullable=False, default="RED")
+    enabled = Column(Boolean, nullable=False, default=True, index=True)
+    display_order = Column(Integer, nullable=False, default=0)
+    last_served_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+
+
+class SignalRecommendation(Base):
+    """Persisted explainable rule-based signal timing recommendation."""
+    __tablename__ = "signal_recommendations"
+
+    id = Column(Integer, primary_key=True)
+    recommendation_id = Column(String(36), nullable=False, unique=True, index=True)
+    junction_id = Column(String(80), nullable=False, index=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow, index=True)
+    current_phase_id = Column(String(80), nullable=True)
+    demand_json = Column(Text, nullable=False)
+    recommendation_json = Column(Text, nullable=False)
+    data_quality = Column(String(40), nullable=False, default="INSUFFICIENT_DATA", index=True)
+    reliability = Column(Float, nullable=False, default=0.0)
+    applied = Column(Boolean, nullable=False, default=False, index=True)
+    applied_at = Column(DateTime, nullable=True)
+    actor = Column(String(80), nullable=True)
+
+
+class SignalSimulationState(Base):
+    """Safe local simulation state; no physical controller is driven."""
+    __tablename__ = "signal_simulation_state"
+
+    id = Column(Integer, primary_key=True)
+    junction_id = Column(String(80), nullable=False, unique=True, index=True)
+    active = Column(Boolean, nullable=False, default=False, index=True)
+    current_phase_id = Column(String(80), nullable=True)
+    phase_kind = Column(String(20), nullable=False, default="GREEN")
+    remaining_seconds = Column(Integer, nullable=False, default=0)
+    cycle_plan_json = Column(Text, nullable=False, default="[]")
+    cursor_index = Column(Integer, nullable=False, default=0)
+    mode = Column(String(40), nullable=False, default="SIMULATION MODE")
+    updated_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+
+
 def _sanitize_plate(value):
     from app.plate_rules import strip_hsrp_noise
     return strip_hsrp_noise(value)
@@ -416,6 +606,10 @@ def _ensure_sqlite_columns():
     columns = {
         "stream_url": "VARCHAR", "stream_type": "VARCHAR", "active": "BOOLEAN DEFAULT 0",
         "last_seen": "DATETIME", "location_known": "BOOLEAN DEFAULT 1",
+        "edge_device_id": "VARCHAR", "edge_status": "VARCHAR DEFAULT 'OFFLINE'",
+        "edge_last_processed": "DATETIME", "edge_config_json": "TEXT",
+        "frames_sampled": "INTEGER DEFAULT 0", "observations_produced": "INTEGER DEFAULT 0",
+        "processing_errors": "INTEGER DEFAULT 0",
     }
     event_columns = {
         "track_id": "VARCHAR", "plate_category": "VARCHAR", "layout": "VARCHAR",
@@ -424,9 +618,206 @@ def _ensure_sqlite_columns():
         "velocity_y": "FLOAT", "vehicle_id": "VARCHAR", "vehicle_type": "VARCHAR",
         "vehicle_color": "VARCHAR", "vehicle_crop_path": "VARCHAR", "appearance_embedding": "TEXT",
         "appearance_model": "VARCHAR", "appearance_embedding_version": "VARCHAR",
-        "appearance_quality": "FLOAT",
+        "appearance_quality": "FLOAT", "original_image_path": "VARCHAR", "privacy_image_path": "VARCHAR",
+        "privacy_status": "VARCHAR", "privacy_metadata": "TEXT", "privacy_processed_at": "DATETIME",
+        "original_image_path_ciphertext": "TEXT", "original_image_path_nonce": "VARCHAR",
+        "original_image_path_key_version": "VARCHAR", "privacy_metadata_ciphertext": "TEXT",
+        "privacy_metadata_nonce": "VARCHAR", "privacy_metadata_key_version": "VARCHAR",
+    }
+    edge_device_columns = {
+        "credential_hash": "VARCHAR", "credential_version": "VARCHAR",
     }
     with engine.begin() as connection:
+        connection.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY,
+                username VARCHAR(80) NOT NULL UNIQUE,
+                password_hash VARCHAR(255) NOT NULL,
+                role VARCHAR(40) NOT NULL,
+                active BOOLEAN NOT NULL DEFAULT 1,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL
+            )
+        """)
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_users_active ON users(active)")
+        connection.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id INTEGER PRIMARY KEY,
+                audit_id VARCHAR(36) NOT NULL UNIQUE,
+                timestamp DATETIME NOT NULL,
+                user_id INTEGER,
+                username VARCHAR(80),
+                role VARCHAR(40),
+                action VARCHAR(80) NOT NULL,
+                resource_type VARCHAR(80),
+                resource_id VARCHAR(120),
+                source TEXT,
+                success BOOLEAN NOT NULL DEFAULT 1,
+                reason VARCHAR(240),
+                details TEXT,
+                previous_hash VARCHAR(64) NOT NULL,
+                current_hash VARCHAR(64) NOT NULL
+            )
+        """)
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_audit_logs_timestamp ON audit_logs(timestamp)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_audit_logs_user_id ON audit_logs(user_id)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_audit_logs_username ON audit_logs(username)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_audit_logs_role ON audit_logs(role)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_audit_logs_resource ON audit_logs(resource_type, resource_id)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_audit_logs_success ON audit_logs(success)")
+        connection.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS edge_devices (
+                id INTEGER PRIMARY KEY,
+                edge_device_id VARCHAR(80) NOT NULL UNIQUE,
+                label VARCHAR(120),
+                status VARCHAR(20) NOT NULL DEFAULT 'OFFLINE',
+                last_seen_at DATETIME,
+                last_processed_at DATETIME,
+                config_json TEXT,
+                queue_mode VARCHAR(30) NOT NULL DEFAULT 'local',
+                frames_sampled INTEGER NOT NULL DEFAULT 0,
+                observations_received INTEGER NOT NULL DEFAULT 0,
+                observations_processed INTEGER NOT NULL DEFAULT 0,
+                observations_failed INTEGER NOT NULL DEFAULT 0,
+                duplicate_observations INTEGER NOT NULL DEFAULT 0,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL
+            )
+        """)
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_edge_devices_device ON edge_devices(edge_device_id)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_edge_devices_status ON edge_devices(status)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_edge_devices_last_seen ON edge_devices(last_seen_at)")
+        existing = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(edge_devices)")}
+        for name, definition in edge_device_columns.items():
+            if name not in existing:
+                connection.exec_driver_sql(f"ALTER TABLE edge_devices ADD COLUMN {name} {definition}")
+        connection.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS edge_observations (
+                id INTEGER PRIMARY KEY,
+                observation_id VARCHAR(120) NOT NULL UNIQUE,
+                camera_id VARCHAR NOT NULL,
+                edge_device_id VARCHAR(80) NOT NULL,
+                frame_id VARCHAR(120),
+                sequence_number INTEGER,
+                capture_timestamp DATETIME NOT NULL,
+                received_at DATETIME NOT NULL,
+                processing_started_at DATETIME,
+                processing_completed_at DATETIME,
+                status VARCHAR(30) NOT NULL DEFAULT 'RECEIVED',
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                max_retries INTEGER NOT NULL DEFAULT 3,
+                next_retry_at DATETIME,
+                error_message VARCHAR(500),
+                payload_json TEXT NOT NULL,
+                plate_event_id INTEGER,
+                queue_name VARCHAR(80),
+                processing_latency_ms FLOAT,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL
+            )
+        """)
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_edge_observations_id ON edge_observations(observation_id)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_edge_observations_camera ON edge_observations(camera_id)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_edge_observations_device ON edge_observations(edge_device_id)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_edge_observations_capture ON edge_observations(capture_timestamp)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_edge_observations_status ON edge_observations(status)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_edge_observations_event ON edge_observations(plate_event_id)")
+        connection.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS retention_runs (
+                id INTEGER PRIMARY KEY,
+                run_id VARCHAR(36) NOT NULL UNIQUE,
+                dry_run BOOLEAN NOT NULL DEFAULT 1,
+                policy_json TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                status VARCHAR(30) NOT NULL DEFAULT 'completed',
+                started_at DATETIME NOT NULL,
+                completed_at DATETIME,
+                actor VARCHAR(80)
+            )
+        """)
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_retention_runs_run ON retention_runs(run_id)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_retention_runs_dry_run ON retention_runs(dry_run)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_retention_runs_status ON retention_runs(status)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_retention_runs_started ON retention_runs(started_at)")
+        connection.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS traffic_junctions (
+                id INTEGER PRIMARY KEY,
+                junction_id VARCHAR(80) NOT NULL UNIQUE,
+                name VARCHAR(160) NOT NULL,
+                lat FLOAT,
+                lng FLOAT,
+                camera_ids_json TEXT NOT NULL DEFAULT '[]',
+                active BOOLEAN NOT NULL DEFAULT 1,
+                controller_mode VARCHAR(30) NOT NULL DEFAULT 'simulation',
+                controller_url VARCHAR(500),
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL
+            )
+        """)
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_traffic_junctions_junction ON traffic_junctions(junction_id)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_traffic_junctions_active ON traffic_junctions(active)")
+        connection.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS signal_phases (
+                id INTEGER PRIMARY KEY,
+                phase_id VARCHAR(80) NOT NULL,
+                junction_id VARCHAR(80) NOT NULL,
+                movement VARCHAR(120) NOT NULL,
+                movement_camera_ids_json TEXT NOT NULL DEFAULT '[]',
+                min_green_seconds INTEGER NOT NULL DEFAULT 15,
+                max_green_seconds INTEGER NOT NULL DEFAULT 90,
+                yellow_seconds INTEGER NOT NULL DEFAULT 4,
+                all_red_seconds INTEGER NOT NULL DEFAULT 2,
+                current_state VARCHAR(30) NOT NULL DEFAULT 'RED',
+                enabled BOOLEAN NOT NULL DEFAULT 1,
+                display_order INTEGER NOT NULL DEFAULT 0,
+                last_served_at DATETIME,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL,
+                UNIQUE(junction_id, phase_id)
+            )
+        """)
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_signal_phases_junction ON signal_phases(junction_id)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_signal_phases_phase ON signal_phases(phase_id)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_signal_phases_enabled ON signal_phases(enabled)")
+        connection.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS signal_recommendations (
+                id INTEGER PRIMARY KEY,
+                recommendation_id VARCHAR(36) NOT NULL UNIQUE,
+                junction_id VARCHAR(80) NOT NULL,
+                created_at DATETIME NOT NULL,
+                current_phase_id VARCHAR(80),
+                demand_json TEXT NOT NULL,
+                recommendation_json TEXT NOT NULL,
+                data_quality VARCHAR(40) NOT NULL DEFAULT 'INSUFFICIENT_DATA',
+                reliability FLOAT NOT NULL DEFAULT 0,
+                applied BOOLEAN NOT NULL DEFAULT 0,
+                applied_at DATETIME,
+                actor VARCHAR(80)
+            )
+        """)
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_signal_recommendations_id ON signal_recommendations(recommendation_id)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_signal_recommendations_junction ON signal_recommendations(junction_id)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_signal_recommendations_created ON signal_recommendations(created_at)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_signal_recommendations_quality ON signal_recommendations(data_quality)")
+        connection.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS signal_simulation_state (
+                id INTEGER PRIMARY KEY,
+                junction_id VARCHAR(80) NOT NULL UNIQUE,
+                active BOOLEAN NOT NULL DEFAULT 0,
+                current_phase_id VARCHAR(80),
+                phase_kind VARCHAR(20) NOT NULL DEFAULT 'GREEN',
+                remaining_seconds INTEGER NOT NULL DEFAULT 0,
+                cycle_plan_json TEXT NOT NULL DEFAULT '[]',
+                cursor_index INTEGER NOT NULL DEFAULT 0,
+                mode VARCHAR(40) NOT NULL DEFAULT 'SIMULATION MODE',
+                updated_at DATETIME NOT NULL
+            )
+        """)
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_signal_simulation_junction ON signal_simulation_state(junction_id)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_signal_simulation_active ON signal_simulation_state(active)")
         connection.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS vehicles (
                 vehicle_id VARCHAR PRIMARY KEY,
@@ -579,6 +970,8 @@ def _ensure_sqlite_columns():
         for name, definition in columns.items():
             if name not in existing:
                 connection.exec_driver_sql(f"ALTER TABLE cameras ADD COLUMN {name} {definition}")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_cameras_edge_device ON cameras(edge_device_id)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_cameras_edge_status ON cameras(edge_status)")
         existing = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(plate_events)")}
         for name, definition in event_columns.items():
             if name not in existing:
@@ -618,7 +1011,13 @@ def persist_plate_event(values, window_seconds=None):
             if ((previous.status != "ok" and values.get("status") == "ok") or
                     (previous.status == values.get("status") and
                      (values.get("confidence") or 0) > (previous.confidence or 0))):
-                for field in ("confidence", "status", "raw_ocr_candidates", "image_path", "rule_violations",
+                for field in ("confidence", "status", "raw_ocr_candidates", "image_path", "original_image_path",
+                              "original_image_path_ciphertext", "original_image_path_nonce",
+                              "original_image_path_key_version",
+                              "privacy_image_path",
+                              "privacy_status", "privacy_metadata", "privacy_metadata_ciphertext",
+                              "privacy_metadata_nonce", "privacy_metadata_key_version",
+                              "privacy_processed_at", "rule_violations",
                               "plate_category", "layout", "bbox_x", "bbox_y", "bbox_width", "bbox_height",
                               "vehicle_type", "vehicle_color", "vehicle_crop_path", "appearance_embedding",
                               "appearance_model", "appearance_embedding_version", "appearance_quality"):

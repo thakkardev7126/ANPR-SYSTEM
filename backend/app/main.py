@@ -10,17 +10,20 @@ import base64
 import csv
 import threading
 import time
+import hmac
+import hashlib
 import cv2
 import numpy as np
 from contextlib import asynccontextmanager, suppress
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, Query, Request
 from fastapi import WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.database import get_db, PlateEvent, Camera, Base, engine, AsyncPlateEventWriter, VehicleMatchCandidate, VehicleAnomaly, PlateSuspicionEvent, RouteAnomalyEvent, EnforcementIncident
+from app.database import get_db, PlateEvent, Camera, Base, engine, AsyncPlateEventWriter, VehicleMatchCandidate, VehicleAnomaly, PlateSuspicionEvent, RouteAnomalyEvent, EnforcementIncident, SignalRecommendation, TrafficJunction
 from app.database import DATABASE_PATH, DATABASE_URL
 from app.database import SessionLocal, backfill_vehicle_ids, ensure_vehicle_for_event, plate_similarity_score, persist_plate_event
 from app.database import HotlistAlert, HotlistNotification
@@ -38,6 +41,7 @@ from app.anpr_pipeline import (
     get_plate_detector,
     MobileStreamReceiver,
     StreamProcessor,
+    has_reviewable_ocr_text,
     locate_plates,
     detection_bbox,
     read_plate_text,
@@ -90,6 +94,37 @@ from app.traffic_analytics import (
     traffic_summary,
     validate_bucket,
 )
+from app.edge import (
+    FrameSamplingConfig,
+    edge_status_payload,
+    enqueue_edge_observation,
+    observation_payload,
+    process_due_edge_observations,
+    process_edge_observation,
+    retention_policy_payload,
+    run_retention,
+    run_simulation,
+    simulation_state,
+)
+from app.traffic_signals import (
+    controller_for_junction,
+    create_junction,
+    current_simulation_state,
+    demand_for_junction,
+    ensure_demo_junction,
+    generate_recommendation,
+    get_junction_or_raise,
+    junction_payload,
+    phases_for_junction,
+    phase_payload,
+    recommendation_payload,
+    reset_simulation,
+    start_simulation,
+    stop_simulation,
+    tick_simulation,
+    update_junction,
+    upsert_phase,
+)
 from app.road_network import (
     create_connection,
     disable_connection,
@@ -100,12 +135,32 @@ from app.road_network import (
     update_connection,
 )
 from app.seed_cameras import seed as seed_cameras
+from app.auth import authenticate_websocket, permission_allowed, rbac_middleware, router as auth_router, seed_demo_users
+from app.privacy import create_privacy_safe_derivative, mask_privacy_regions, metadata_json
+from app.crypto import (
+    DecryptionError,
+    EncryptionConfigurationError,
+    decrypt_sensitive,
+    encrypt_sensitive,
+    is_encryption_configured,
+)
+from app.security import (
+    body_size_limit_middleware,
+    production_requires_encryption,
+    public_security_status,
+    resolve_under_root,
+    security_headers_middleware,
+    validate_image_size,
+)
+from app.security_config import get_security_settings
 
 UPLOAD_DIR = os.getenv("ANPR_UPLOAD_DIR", os.path.join(os.path.dirname(__file__), "..", "uploads"))
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+ORIGINAL_EVIDENCE_DIR = os.getenv("ANPR_ORIGINAL_EVIDENCE_DIR", os.path.join(os.path.dirname(__file__), "..", "evidence", "originals"))
 REVIEW_FEEDBACK_DIR = os.getenv("ANPR_REVIEW_DIR", os.path.join(PROJECT_ROOT, "data", "review_feedback"))
 FRONTEND_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "frontend"))
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(ORIGINAL_EVIDENCE_DIR, exist_ok=True)
 os.makedirs(os.path.join(REVIEW_FEEDBACK_DIR, "images"), exist_ok=True)
 
 LIVE_TRACK_OCR_INTERVAL_SECONDS = 8.0
@@ -134,12 +189,17 @@ async def lifespan(_app):
 
 
 app = FastAPI(title="City-Wide ANPR Trajectory Tracking — Demo API", lifespan=lifespan)
+app.middleware("http")(rbac_middleware)
+app.middleware("http")(security_headers_middleware)
+app.middleware("http")(body_size_limit_middleware)
+app.include_router(auth_router)
 app.include_router(hotlist_router)
 app.include_router(enforcement_router)
 
+security_settings = get_security_settings()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],       # open for the hackathon demo; restrict in production
+    allow_origins=security_settings.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -149,9 +209,8 @@ Base.metadata.create_all(bind=engine)
 seed_cameras()
 with SessionLocal() as _startup_db:
     seed_demo_pcr_vehicles(_startup_db)
+    seed_demo_users(_startup_db)
     backfill_vehicle_ids(_startup_db)
-
-app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 
 async def warm_up_ocr_models():
@@ -177,7 +236,373 @@ def system_status(db: Session = Depends(get_db)):
             {"camera_id": c.camera_id, "label": c.label, "lat": camera_location(c)[0], "lng": camera_location(c)[1], "location_known": bool(c.location_known)}
             for c in db.query(Camera).order_by(Camera.camera_id.asc()).all()
         ],
+        "security": public_security_status(),
     }
+
+
+@app.get("/api/security/status")
+def security_status():
+    return public_security_status()
+
+
+def _current_actor(request: Request):
+    user = getattr(request.state, "current_user", None) or {}
+    return user.get("username")
+
+
+def _edge_shared_secret(edge_device_id: str) -> tuple[str | None, str]:
+    device_key = f"ANPR_EDGE_TOKEN_{re.sub(r'[^A-Za-z0-9]', '_', edge_device_id).upper()}"
+    return os.getenv(device_key) or os.getenv("ANPR_EDGE_TOKEN"), os.getenv("ANPR_EDGE_TOKEN_VERSION", "v1")
+
+
+def _safe_digest(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _edge_body_for_signature(payload) -> bytes:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+
+
+def _verify_edge_signature(request: Request, payload) -> tuple[bool, str]:
+    settings = get_security_settings()
+    edge_device_id = str((payload or {}).get("edge_device_id") or "").strip()
+    secret, _version = _edge_shared_secret(edge_device_id)
+    if not settings.edge_auth_required:
+        return True, "development_edge_auth_optional"
+    if not edge_device_id:
+        return False, "missing_edge_device_id"
+    if not secret:
+        return False, "edge_secret_not_configured"
+    bearer = request.headers.get("authorization", "")
+    if bearer.lower().startswith("bearer "):
+        token = bearer.split(None, 1)[1].strip()
+        return hmac.compare_digest(token, secret), "bearer"
+    signature = request.headers.get("x-anpr-edge-signature", "")
+    timestamp = request.headers.get("x-anpr-edge-timestamp", "")
+    if not signature or not timestamp:
+        return False, "missing_edge_signature"
+    try:
+        seen_at = datetime.datetime.fromisoformat(timestamp.replace("Z", "+00:00")).replace(tzinfo=None)
+    except ValueError:
+        return False, "bad_edge_timestamp"
+    skew = abs((datetime.datetime.utcnow() - seen_at).total_seconds())
+    if skew > settings.edge_timestamp_skew_seconds:
+        return False, "stale_edge_timestamp"
+    signed = timestamp.encode("utf-8") + b"." + _edge_body_for_signature(payload)
+    expected = hmac.new(secret.encode("utf-8"), signed, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(signature, expected), "hmac"
+
+
+def _authorize_edge_request(request: Request, payload) -> None:
+    valid, reason = _verify_edge_signature(request, payload)
+    if valid:
+        return
+    from app.audit import append_audit_log_safe
+    append_audit_log_safe(
+        actor=getattr(request.state, "current_user_model", None),
+        action="edge_auth_failure",
+        resource_type="edge_observation",
+        request=request,
+        success=False,
+        reason=reason,
+        details={"edge_device_id": (payload or {}).get("edge_device_id"), "observation_id": (payload or {}).get("observation_id")},
+    )
+    raise HTTPException(status_code=401, detail="Invalid edge credentials")
+
+
+async def _edge_ingest_one(payload, *, process_inline=True):
+    row, duplicate = await asyncio.to_thread(enqueue_edge_observation, payload)
+    processed = row
+    if not duplicate and process_inline:
+        processed = await asyncio.to_thread(process_edge_observation, row.observation_id)
+        if processed and processed.plate_event_id:
+            with SessionLocal() as db:
+                event = db.get(PlateEvent, processed.plate_event_id)
+                camera = db.get(Camera, event.camera_id) if event else None
+                if event:
+                    await event_hub.broadcast({
+                        "type": "event_created",
+                        **_event_payload(event, camera.label if camera else event.camera_id),
+                    })
+    return {
+        **observation_payload(processed or row),
+        "duplicate": duplicate or bool(processed and processed.observation_id == row.observation_id and processed.status == "DUPLICATE"),
+    }
+
+
+@app.get("/api/edge/sampling")
+def get_edge_sampling():
+    """Current metadata-first frame sampling configuration for edge agents."""
+    return FrameSamplingConfig().payload()
+
+
+@app.get("/api/edge/status")
+def get_edge_status(db: Session = Depends(get_db)):
+    """Edge, queue, camera-health, throughput, and simulation status."""
+    return edge_status_payload(db)
+
+
+@app.post("/api/edge/observations")
+async def ingest_edge_observation(request: Request):
+    """Metadata-first central ingestion endpoint for one edge observation."""
+    try:
+        payload = await request.json()
+        _authorize_edge_request(request, payload if isinstance(payload, dict) else {})
+        result = await _edge_ingest_one(payload, process_inline=os.getenv("ANPR_EDGE_PROCESS_INLINE", "1") != "0")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return result
+
+
+@app.post("/api/edge/observations/batch")
+async def ingest_edge_observation_batch(request: Request):
+    """Metadata-first central ingestion endpoint for a small edge batch."""
+    try:
+        payload = await request.json()
+        items = payload.get("observations") if isinstance(payload, dict) else payload
+        if not isinstance(items, list) or not items:
+            raise ValueError("observations must be a non-empty list")
+        max_batch = get_security_settings().max_edge_batch_size
+        if len(items) > max_batch:
+            raise ValueError(f"batch size must be <= {max_batch} observations")
+        auth_payload = items[0] if items and isinstance(items[0], dict) else {}
+        _authorize_edge_request(request, auth_payload)
+        results = []
+        for item in items:
+            results.append(await _edge_ingest_one(item, process_inline=os.getenv("ANPR_EDGE_PROCESS_INLINE", "1") != "0"))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        "received": len(results),
+        "processed": len([item for item in results if item.get("status") == "PROCESSED"]),
+        "duplicates": len([item for item in results if item.get("duplicate")]),
+        "items": results,
+    }
+
+
+@app.post("/api/edge/workers/run")
+async def run_edge_worker_once(limit: int = Query(100, ge=1, le=1000)):
+    """Drain queued edge observations once; suitable for local/demo workers."""
+    rows = await asyncio.to_thread(process_due_edge_observations, limit)
+    created = []
+    with SessionLocal() as db:
+        for row in rows:
+            if row and row.plate_event_id:
+                event = db.get(PlateEvent, row.plate_event_id)
+                camera = db.get(Camera, event.camera_id) if event else None
+                if event:
+                    payload = _event_payload(event, camera.label if camera else event.camera_id)
+                    created.append(payload)
+                    await event_hub.broadcast({"type": "event_created", **payload})
+    return {"processed": len([row for row in rows if row]), "events_created": created}
+
+
+@app.post("/api/edge/simulation/start")
+async def start_edge_simulation(request: Request):
+    """Run a bounded SIMULATION / DEMO 500-camera-capable metadata load."""
+    try:
+        config = await request.json()
+    except Exception:
+        config = {}
+    if simulation_state.active:
+        raise HTTPException(status_code=409, detail="Simulation already running")
+    result = await asyncio.to_thread(run_simulation, config if isinstance(config, dict) else {})
+    return result
+
+
+@app.post("/api/edge/simulation/stop")
+def stop_edge_simulation():
+    simulation_state.finish()
+    return simulation_state.payload()
+
+
+@app.get("/api/retention/policy")
+def get_retention_policy():
+    """Configured metadata/raw-image lifecycle policy."""
+    return retention_policy_payload()
+
+
+@app.post("/api/retention/run")
+async def run_retention_policy(request: Request):
+    """Run raw/high-resolution image lifecycle cleanup; dry-run by default."""
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    payload = payload if isinstance(payload, dict) else {}
+    result = await asyncio.to_thread(
+        run_retention,
+        bool(payload.get("dry_run", True)),
+        payload.get("raw_image_days"),
+        payload.get("action"),
+        _current_actor(request),
+    )
+    return result
+
+
+def _signal_http_error(exc):
+    message = str(exc)
+    status = 404 if "not found" in message.lower() else 422
+    return HTTPException(status_code=status, detail=message)
+
+
+@app.get("/api/signals/junctions")
+def list_signal_junctions(db: Session = Depends(get_db)):
+    """Configured smart-signal demo junctions; recommendation only, no real control."""
+    ensure_demo_junction(db)
+    rows = db.query(TrafficJunction).order_by(TrafficJunction.junction_id.asc()).all()
+    return [junction_payload(row, phases_for_junction(db, row.junction_id)) for row in rows]
+
+
+@app.post("/api/signals/junctions", status_code=201)
+async def create_signal_junction(request: Request, db: Session = Depends(get_db)):
+    try:
+        row = create_junction(db, await request.json())
+        return junction_payload(row, phases_for_junction(db, row.junction_id))
+    except ValueError as exc:
+        raise _signal_http_error(exc) from exc
+
+
+@app.get("/api/signals/junctions/{junction_id}")
+def get_signal_junction(junction_id: str, db: Session = Depends(get_db)):
+    try:
+        row = get_junction_or_raise(db, junction_id)
+        return junction_payload(row, phases_for_junction(db, row.junction_id))
+    except ValueError as exc:
+        raise _signal_http_error(exc) from exc
+
+
+@app.patch("/api/signals/junctions/{junction_id}")
+async def patch_signal_junction(junction_id: str, request: Request, db: Session = Depends(get_db)):
+    try:
+        row = update_junction(db, junction_id, await request.json())
+        return junction_payload(row, phases_for_junction(db, row.junction_id))
+    except ValueError as exc:
+        raise _signal_http_error(exc) from exc
+
+
+@app.delete("/api/signals/junctions/{junction_id}")
+def deactivate_signal_junction(junction_id: str, db: Session = Depends(get_db)):
+    try:
+        row = update_junction(db, junction_id, {"active": False})
+        return junction_payload(row, phases_for_junction(db, row.junction_id))
+    except ValueError as exc:
+        raise _signal_http_error(exc) from exc
+
+
+@app.post("/api/signals/junctions/{junction_id}/phases", status_code=201)
+async def configure_signal_phase(junction_id: str, request: Request, db: Session = Depends(get_db)):
+    try:
+        row = upsert_phase(db, junction_id, await request.json())
+        return phase_payload(row)
+    except ValueError as exc:
+        raise _signal_http_error(exc) from exc
+
+
+@app.get("/api/signals/junctions/{junction_id}/demand")
+def get_signal_demand(junction_id: str, window_minutes: int = Query(60, ge=5, le=1440), db: Session = Depends(get_db)):
+    try:
+        return demand_for_junction(db, junction_id, window_minutes)
+    except ValueError as exc:
+        raise _signal_http_error(exc) from exc
+
+
+@app.post("/api/signals/recommendation")
+async def create_signal_recommendation(request: Request, db: Session = Depends(get_db)):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    try:
+        junction_id = str((payload or {}).get("junction_id") or "JUNC-DEMO-01")
+        cycle_seconds = int((payload or {}).get("cycle_seconds") or 90)
+        result = generate_recommendation(db, junction_id, actor=_current_actor(request), cycle_seconds=cycle_seconds)
+        await event_hub.broadcast({"type": "signal_recommendation", "data": result})
+        return result
+    except ValueError as exc:
+        raise _signal_http_error(exc) from exc
+
+
+@app.get("/api/signals/recommendations")
+def list_signal_recommendations(junction_id: str | None = Query(None), limit: int = Query(25, ge=1, le=100), db: Session = Depends(get_db)):
+    query = db.query(SignalRecommendation)
+    if junction_id:
+        query = query.filter(SignalRecommendation.junction_id == junction_id)
+    rows = query.order_by(SignalRecommendation.created_at.desc(), SignalRecommendation.id.desc()).limit(limit).all()
+    return {"items": [recommendation_payload(row) for row in rows], "total": len(rows)}
+
+
+@app.get("/api/signals/simulation/{junction_id}")
+def get_signal_simulation(junction_id: str, db: Session = Depends(get_db)):
+    try:
+        get_junction_or_raise(db, junction_id)
+        return current_simulation_state(db, junction_id)
+    except ValueError as exc:
+        raise _signal_http_error(exc) from exc
+
+
+@app.post("/api/signals/simulation/{junction_id}/start")
+async def start_signal_simulation(junction_id: str, request: Request, db: Session = Depends(get_db)):
+    try:
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        state = start_simulation(db, junction_id, (payload or {}).get("recommendation_id"), _current_actor(request))
+        await event_hub.broadcast({"type": "signal_state", "data": state})
+        return state
+    except ValueError as exc:
+        raise _signal_http_error(exc) from exc
+
+
+@app.post("/api/signals/simulation/{junction_id}/tick")
+async def tick_signal_simulation(junction_id: str, request: Request, db: Session = Depends(get_db)):
+    try:
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        state = tick_simulation(db, junction_id, int((payload or {}).get("seconds") or 1))
+        await event_hub.broadcast({"type": "signal_state", "data": state})
+        return state
+    except ValueError as exc:
+        raise _signal_http_error(exc) from exc
+
+
+@app.post("/api/signals/simulation/{junction_id}/stop")
+async def stop_signal_simulation(junction_id: str, db: Session = Depends(get_db)):
+    try:
+        state = stop_simulation(db, junction_id)
+        await event_hub.broadcast({"type": "signal_state", "data": state})
+        return state
+    except ValueError as exc:
+        raise _signal_http_error(exc) from exc
+
+
+@app.post("/api/signals/simulation/{junction_id}/reset")
+async def reset_signal_simulation(junction_id: str, db: Session = Depends(get_db)):
+    try:
+        state = reset_simulation(db, junction_id)
+        await event_hub.broadcast({"type": "signal_state", "data": state})
+        return state
+    except ValueError as exc:
+        raise _signal_http_error(exc) from exc
+
+
+@app.post("/api/signals/controller/apply")
+async def apply_signal_recommendation_to_controller(request: Request, db: Session = Depends(get_db)):
+    try:
+        payload = await request.json()
+        recommendation_id = str((payload or {}).get("recommendation_id") or "")
+        row = db.query(SignalRecommendation).filter(SignalRecommendation.recommendation_id == recommendation_id).first()
+        if not row:
+            raise ValueError("recommendation not found")
+        junction = get_junction_or_raise(db, row.junction_id)
+        result = controller_for_junction(junction).apply_recommendation(db, row.recommendation_id)
+        await event_hub.broadcast({"type": "signal_state", "data": current_simulation_state(db, row.junction_id)})
+        return result
+    except ValueError as exc:
+        raise _signal_http_error(exc) from exc
 
 
 class StreamNode:
@@ -484,6 +909,27 @@ def _candidate_is_complete_valid(candidate):
     )
 
 
+def _candidate_is_reviewable_partial(candidate):
+    if not candidate:
+        return False
+    return (
+        not _candidate_is_complete_valid(candidate)
+        and bool(candidate.get("needs_review") or is_review_status(candidate.get("status")))
+        and bool(candidate.get("reviewable", True))
+        and has_reviewable_ocr_text(candidate)
+    )
+
+
+def _candidate_should_be_visible(candidate, has_valid_plate=False):
+    if not candidate:
+        return False
+    if _candidate_is_complete_valid(candidate):
+        return True
+    if has_valid_plate:
+        return False
+    return _candidate_is_reviewable_partial(candidate)
+
+
 def _parse_candidates(raw_candidates):
     try:
         parsed = json.loads(raw_candidates or "[]")
@@ -513,6 +959,8 @@ def _candidate_metadata(raw_candidates, plate_text=None):
 
 
 def _event_payload(event, camera_label=None, filename=None):
+    display_image = event.privacy_image_path or f"/api/evidence/{event.id}/image?kind=privacy"
+    original_available = bool(event.original_image_path or event.original_image_path_ciphertext)
     return {
         "event_id": event.id,
         "global_vehicle_id": event.vehicle_id,
@@ -535,7 +983,11 @@ def _event_payload(event, camera_label=None, filename=None):
         "appearance_embedding_version": event.appearance_embedding_version,
         "appearance_quality": event.appearance_quality,
         "needs_review": is_review_status(event.status),
-        "image_path": event.image_path,
+        "image_path": display_image,
+        "privacy_image_path": event.privacy_image_path,
+        "privacy_status": event.privacy_status,
+        "original_image_available": original_available,
+        "original_image_path": f"/api/evidence/{event.id}/image?kind=original" if original_available else None,
     }
 
 
@@ -575,6 +1027,10 @@ def _public_scan_payload(result):
     def strip_debug(item):
         cleaned = dict(item)
         cleaned.pop("raw_ocr_candidates", None)
+        for key in ("crop_image_path", "feedback_image_path"):
+            value = cleaned.get(key)
+            if value and not str(value).startswith(("/", "http://", "https://")):
+                cleaned.pop(key, None)
         return cleaned
 
     payload = strip_debug(result)
@@ -605,14 +1061,109 @@ def _print_scan_debug(endpoint_name, result):
 def _save_vehicle_crop(image_path, crop_bgr, suffix):
     if crop_bgr is None or getattr(crop_bgr, "size", 0) == 0:
         return None
-    upload_dir = os.path.dirname(os.path.abspath(image_path))
     stem = os.path.splitext(os.path.basename(image_path))[0]
     crop_name = f"{stem}_{suffix}.jpg"
-    crop_path = os.path.join(upload_dir, crop_name)
+    crop_path = os.path.join(UPLOAD_DIR, crop_name)
     cv2.imwrite(crop_path, crop_bgr)
-    if os.path.basename(upload_dir) == "uploads":
-        return f"/uploads/{crop_name}"
-    return crop_path
+    return f"/uploads/{crop_name}"
+
+
+def _privacy_filename(filename):
+    stem = os.path.splitext(os.path.basename(filename))[0]
+    return f"{stem}_privacy.jpg"
+
+
+def _plate_boxes_from_candidates(raw_candidates):
+    boxes = []
+    seen = set()
+    for candidate in _parse_candidates(raw_candidates):
+        bbox = candidate.get("bbox") if isinstance(candidate, dict) else None
+        if not bbox:
+            continue
+        key = (int(bbox.get("x", 0)), int(bbox.get("y", 0)), int(bbox.get("width", 0)), int(bbox.get("height", 0)))
+        if key in seen:
+            continue
+        seen.add(key)
+        boxes.append({"x": key[0], "y": key[1], "width": key[2], "height": key[3]})
+    return boxes
+
+
+async def _create_privacy_derivative(source_path, filename, raw_candidates):
+    privacy_name = _privacy_filename(filename)
+    privacy_path = os.path.join(UPLOAD_DIR, privacy_name)
+    result = await asyncio.to_thread(
+        create_privacy_safe_derivative,
+        source_path,
+        privacy_path,
+        _plate_boxes_from_candidates(raw_candidates),
+    )
+    if result.privacy_image_path:
+        return f"/uploads/{privacy_name}", result.status, result.metadata
+    return None, result.status, result.metadata
+
+
+def _resolve_event_image(event, kind):
+    if kind == "original":
+        path = _sensitive_event_value(event, "original_image_path")
+    else:
+        path = event.privacy_image_path or event.image_path
+        if path and path.startswith("/uploads/"):
+            path = os.path.join(UPLOAD_DIR, os.path.basename(path))
+    if not path:
+        return None
+    path = os.path.abspath(path)
+    allowed_roots = [os.path.abspath(UPLOAD_DIR), os.path.abspath(ORIGINAL_EVIDENCE_DIR)]
+    if not any(path == root or path.startswith(root + os.sep) for root in allowed_roots):
+        return None
+    return path if os.path.isfile(path) else None
+
+
+def _sensitive_event_value(event, field):
+    ciphertext = getattr(event, f"{field}_ciphertext", None)
+    if ciphertext:
+        try:
+            return decrypt_sensitive(
+                ciphertext,
+                getattr(event, f"{field}_nonce", None),
+                getattr(event, f"{field}_key_version", None),
+                resource_type="plate_event",
+                purpose=field,
+            )
+        except DecryptionError:
+            logging.exception("Could not decrypt sensitive event field %s for event %s", field, getattr(event, "id", None))
+            return None
+    return getattr(event, field, None)
+
+
+def _prepare_sensitive_event_values(values):
+    values = dict(values)
+    if not is_encryption_configured():
+        if production_requires_encryption() and values.get("original_image_path"):
+            raise HTTPException(status_code=503, detail="Encryption key is required in production")
+        return values
+
+    original_path = values.get("original_image_path")
+    if original_path:
+        try:
+            encrypted = encrypt_sensitive(original_path, resource_type="plate_event", purpose="original_image_path")
+        except EncryptionConfigurationError as exc:
+            raise HTTPException(status_code=503, detail="Encryption key is not usable") from exc
+        values["original_image_path_ciphertext"] = encrypted.ciphertext
+        values["original_image_path_nonce"] = encrypted.nonce
+        values["original_image_path_key_version"] = encrypted.key_version
+        values["original_image_path"] = None
+
+    privacy_metadata = values.get("privacy_metadata")
+    if privacy_metadata:
+        try:
+            encrypted = encrypt_sensitive(privacy_metadata, resource_type="plate_event", purpose="privacy_metadata")
+        except EncryptionConfigurationError as exc:
+            raise HTTPException(status_code=503, detail="Encryption key is not usable") from exc
+        values["privacy_metadata_ciphertext"] = encrypted.ciphertext
+        values["privacy_metadata_nonce"] = encrypted.nonce
+        values["privacy_metadata_key_version"] = encrypted.key_version
+        values["privacy_metadata"] = None
+    return values
 
 
 async def _appearance_values(filepath, bbox, detection_id):
@@ -640,7 +1191,12 @@ async def _process_image_safely(filepath):
         }])
 
 
-async def _create_scan_event(db, camera_id, filepath, filename, persist_unreadable=True, selection="all"):
+async def _broadcast_scan_preview(payload):
+    await event_hub.broadcast({"type": "anpr_scan", "data": _public_scan_payload(payload)})
+
+
+async def _create_scan_event(db, camera_id, filepath, filename, persist_unreadable=True,
+                             selection="all", early_broadcast=None):
     cam = db.get(Camera, camera_id)
     if not cam:
         raise HTTPException(status_code=400, detail=f"Unknown camera_id '{camera_id}'")
@@ -653,14 +1209,22 @@ async def _create_scan_event(db, camera_id, filepath, filename, persist_unreadab
             groups.setdefault(candidate.get("detection_id", 0), []).append(candidate)
     if not groups:
         groups = {0: [dict(text=None, confidence=0, status=PENDING_REVIEW_STATUS,
-                           violations=["unreadable"], needs_review=True)]}
+                           violations=["unreadable"], needs_review=False, reviewable=False)]}
     winners = [(key, best_plate_candidate(items), items) for key, items in groups.items()]
+    has_valid_plate = any(_candidate_is_complete_valid(winner) for _, winner, _ in winners if winner)
     winners.sort(key=lambda entry: ((entry[1].get("bbox") or {}).get("width", 0) *
                                    (entry[1].get("bbox") or {}).get("height", 0)), reverse=True)
     if selection == "largest":
         winners = winners[:1]
     results = []
+    privacy_url = None
+    privacy_status = None
+    privacy_meta = {}
+    privacy_ready = False
+    previewed = set()
     for detection_id, best, candidates in winners:
+        if has_valid_plate and not _candidate_should_be_visible(best, has_valid_plate=True):
+            continue
         plate_text = best.get("text")
         confidence = best.get("confidence", 0)
         rule = normalize_plate_text(plate_text)
@@ -672,20 +1236,50 @@ async def _create_scan_event(db, camera_id, filepath, filename, persist_unreadab
         payload = dict(event_id=None, camera_id=camera_id, camera_label=cam.label,
                        plate_text=plate_text, plate_number=plate_text, confidence=confidence,
                        status=status, timestamp=iso_utc(datetime.datetime.utcnow()),
-                       image_path=None, duplicate=False)
-        should_persist = persist_unreadable or _candidate_is_complete_valid({
+                       image_path=privacy_url, privacy_image_path=privacy_url,
+                       privacy_status=privacy_status, duplicate=False)
+        candidate_state = {
             "text": plate_text,
             "confidence": confidence,
             "status": status,
             "partial": bool(best.get("partial")),
-        })
+            "needs_review": best.get("needs_review"),
+            "raw_text": best.get("raw_text"),
+            "joined_text": best.get("joined_text"),
+            "reviewable": best.get("reviewable", True),
+        }
+        payload.update(detection_id=detection_id, bbox=best.get("bbox"),
+                       raw_ocr_candidates=candidates, raw_text=metadata["raw_text"],
+                       crop_image_path=metadata["crop_image_path"],
+                       partial=bool(best.get("partial")), quality=best.get("quality"),
+                       needs_review=is_review_status(payload["status"]))
+        if early_broadcast and _candidate_is_complete_valid(candidate_state):
+            preview_key = plate_text or detection_id
+            if preview_key not in previewed:
+                previewed.add(preview_key)
+                await early_broadcast({**payload, "detections": [payload], "selection": selection})
+        should_persist = (
+            _candidate_is_complete_valid(candidate_state)
+            or _candidate_is_reviewable_partial(candidate_state)
+            or (persist_unreadable and not has_valid_plate and not has_reviewable_ocr_text(candidate_state))
+        )
         if should_persist:
-            values = dict(camera_id=camera_id, image_path=metadata["crop_image_path"] or f"/uploads/{filename}",
+            if not privacy_ready:
+                privacy_url, privacy_status, privacy_meta = await _create_privacy_derivative(filepath, filename, raw_candidates)
+                privacy_ready = True
+                payload.update(image_path=privacy_url, privacy_image_path=privacy_url, privacy_status=privacy_status)
+            values = dict(camera_id=camera_id, image_path=privacy_url,
+                          original_image_path=os.path.abspath(filepath),
+                          privacy_image_path=privacy_url,
+                          privacy_status=privacy_status,
+                          privacy_metadata=metadata_json(privacy_meta),
+                          privacy_processed_at=datetime.datetime.utcnow(),
                           plate_text=plate_text, confidence=confidence, status=status,
                           raw_ocr_candidates=encoded)
             for field in ("plate_category", "layout", "rule_violations", "bbox_x", "bbox_y", "bbox_width", "bbox_height"):
                 values[field] = metadata[field]
             values.update(await _appearance_values(filepath, best.get("bbox") or metadata, detection_id))
+            values = _prepare_sensitive_event_values(values)
             event, duplicate = await asyncio.to_thread(persist_plate_event, values)
             payload.update(_event_payload(event, cam.label, filename), duplicate=duplicate)
             with SessionLocal() as alert_db:
@@ -700,11 +1294,6 @@ async def _create_scan_event(db, camera_id, filepath, filename, persist_unreadab
                         item["incident_id"] = incident["incident_id"]
                         item["enforcement_incident"] = incident
                     payload["hotlist_alerts"].append(item)
-        payload.update(detection_id=detection_id, bbox=best.get("bbox"),
-                       raw_ocr_candidates=candidates, raw_text=metadata["raw_text"],
-                       crop_image_path=metadata["crop_image_path"],
-                       partial=bool(best.get("partial")), quality=best.get("quality"),
-                       needs_review=is_review_status(payload["status"]))
         results.append(payload)
     best_result = max(results, key=_scan_result_rank)
     return {**best_result, "detections": results, "selection": selection,
@@ -752,10 +1341,11 @@ async def _save_request_image(request: Request, fallback_name="frame.jpg"):
         raise HTTPException(status_code=400, detail="Invalid camera_id")
     if not image_bytes:
         raise HTTPException(status_code=400, detail="Empty image payload")
+    validate_image_size(len(image_bytes))
 
     ext = os.path.splitext(original_name)[1] or ".jpg"
     filename = f"{camera_id}_{uuid.uuid4().hex[:8]}{ext}"
-    filepath = os.path.join(UPLOAD_DIR, filename)
+    filepath = os.path.join(ORIGINAL_EVIDENCE_DIR, filename)
     with open(filepath, "wb") as output_file:
         output_file.write(image_bytes)
     return camera_id, filepath, filename
@@ -981,6 +1571,11 @@ def camera_snapshot(camera_id: str):
     frame = node.snapshot()
     if frame is None:
         raise HTTPException(status_code=503, detail="No frame available")
+    try:
+        frame, _ = mask_privacy_regions(frame)
+    except Exception:
+        logging.exception("Privacy masking failed for live snapshot; returning unavailable")
+        raise HTTPException(status_code=503, detail="Privacy-safe snapshot unavailable")
     ok, encoded = cv2.imencode(".jpg", frame)
     if not ok:
         raise HTTPException(status_code=503, detail="Could not encode frame")
@@ -990,6 +1585,9 @@ def camera_snapshot(camera_id: str):
 
 @app.websocket("/ws/cameras/{camera_id}")
 async def camera_socket(websocket: WebSocket, camera_id: str):
+    user = await authenticate_websocket(websocket)
+    if not user or not permission_allowed(user, "camera:read"):
+        return
     await websocket.accept()
     try:
         while True:
@@ -1012,6 +1610,9 @@ async def camera_socket(websocket: WebSocket, camera_id: str):
 
 @app.websocket("/ws/events")
 async def events_socket(websocket: WebSocket):
+    user = await authenticate_websocket(websocket)
+    if not user or not permission_allowed(user, "event:read"):
+        return
     await event_hub.connect(websocket)
     try:
         await websocket.send_json({"type": "connected"})
@@ -1021,6 +1622,9 @@ async def events_socket(websocket: WebSocket):
                 await websocket.send_json({"type": "pong"})
                 continue
             if message.get("action") == "correct_event":
+                if not permission_allowed(user, "review:write"):
+                    await websocket.send_json({"type": "error", "detail": "Permission denied"})
+                    continue
                 try:
                     payload = await asyncio.to_thread(
                         _correct_plate_event_sync,
@@ -1049,12 +1653,15 @@ async def upload_plate_photo(
     """
     ext = os.path.splitext(file.filename or "photo.jpg")[1] or ".jpg"
     filename = f"{camera_id}_{uuid.uuid4().hex[:8]}{ext}"
-    filepath = os.path.join(UPLOAD_DIR, filename)
+    filepath = os.path.join(ORIGINAL_EVIDENCE_DIR, filename)
 
+    data = await file.read()
+    validate_image_size(len(data))
     with open(filepath, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+        f.write(data)
 
-    result = await _create_scan_event(db, camera_id, filepath, filename, persist_unreadable=True)
+    result = await _create_scan_event(db, camera_id, filepath, filename, persist_unreadable=True,
+                                      early_broadcast=_broadcast_scan_preview)
     db.commit()
     public_result = _public_scan_payload(result)
     await event_hub.broadcast({"type": "event_created", **public_result})
@@ -1066,7 +1673,8 @@ async def scan_photo(request: Request, db: Session = Depends(get_db)):
     """Canonical scanner endpoint for manual photos; accepts multipart or JSON base64."""
     camera_id, filepath, filename = await _save_request_image(request, "scan.jpg")
     result = await _create_scan_event(db, camera_id, filepath, filename, persist_unreadable=True,
-                                      selection=request.query_params.get("selection", "all"))
+                                      selection=request.query_params.get("selection", "all"),
+                                      early_broadcast=_broadcast_scan_preview)
     _print_scan_debug("/api/scan", result)
     db.commit()
     public_result = _public_scan_payload(result)
@@ -1079,7 +1687,8 @@ async def process_frame(request: Request, db: Session = Depends(get_db)):
     """Canonical auto-scan endpoint; accepts multipart frames or JSON base64 frames."""
     camera_id, filepath, filename = await _save_request_image(request, "frame.jpg")
     result = await _create_scan_event(db, camera_id, filepath, filename, persist_unreadable=False,
-                                      selection=request.query_params.get("selection", "all"))
+                                      selection=request.query_params.get("selection", "all"),
+                                      early_broadcast=_broadcast_scan_preview)
     db.commit()
     public_result = _public_scan_payload(result)
     if not public_result.get("event_id"):
@@ -1117,9 +1726,11 @@ async def upload_plate_batch(
     for uploaded_file in files:
         ext = os.path.splitext(uploaded_file.filename or "photo.jpg")[1] or ".jpg"
         filename = f"{camera_id}_{uuid.uuid4().hex[:8]}{ext}"
-        filepath = os.path.join(UPLOAD_DIR, filename)
+        filepath = os.path.join(ORIGINAL_EVIDENCE_DIR, filename)
+        data = await uploaded_file.read()
+        validate_image_size(len(data))
         with open(filepath, "wb") as output_file:
-            shutil.copyfileobj(uploaded_file.file, output_file)
+            output_file.write(data)
 
         result = await _create_scan_event(
             db,
@@ -1127,6 +1738,7 @@ async def upload_plate_batch(
             filepath,
             filename,
             persist_unreadable=scan_mode != "auto",
+            early_broadcast=_broadcast_scan_preview,
         )
         result["filename"] = uploaded_file.filename
         if result.get("event_id"):
@@ -1161,15 +1773,18 @@ async def clear_events(db: Session = Depends(get_db)):
     events = db.query(PlateEvent).all()
     deleted_files = 0
     for event in events:
-        if event.image_path:
-            image_path = os.path.join(os.path.dirname(__file__), "..", event.image_path.lstrip("/"))
-            if os.path.isfile(image_path):
-                os.remove(image_path)
-                deleted_files += 1
-        if event.vehicle_crop_path:
-            crop_path = os.path.join(os.path.dirname(__file__), "..", event.vehicle_crop_path.lstrip("/"))
-            if os.path.isfile(crop_path):
-                os.remove(crop_path)
+        paths = set()
+        for url_value in (event.image_path, event.privacy_image_path, event.vehicle_crop_path):
+            if url_value and str(url_value).startswith("/uploads/"):
+                paths.add(os.path.join(UPLOAD_DIR, os.path.basename(url_value)))
+        if event.original_image_path:
+            paths.add(event.original_image_path)
+        decrypted_original = _sensitive_event_value(event, "original_image_path")
+        if decrypted_original:
+            paths.add(decrypted_original)
+        for path in paths:
+            if os.path.isfile(path):
+                os.remove(path)
                 deleted_files += 1
     deleted_events = len(events)
     # Keep alert snapshots without references to IDs SQLite may reuse after a clear.
@@ -1195,7 +1810,11 @@ def get_events(db: Session = Depends(get_db)):
             "global_vehicle_id": e.vehicle_id,
             "vehicle_id": e.vehicle_id,
             "camera_id": e.camera_id,
-            "image_path": e.image_path,
+            "image_path": e.privacy_image_path or f"/api/evidence/{e.id}/image?kind=privacy",
+            "privacy_image_path": e.privacy_image_path,
+            "privacy_status": e.privacy_status,
+            "original_image_available": bool(e.original_image_path or e.original_image_path_ciphertext),
+            "original_image_path": f"/api/evidence/{e.id}/image?kind=original" if (e.original_image_path or e.original_image_path_ciphertext) else None,
             "plate_text": e.plate_text,
             "confidence": e.confidence,
             "status": e.status,
@@ -1222,6 +1841,45 @@ def get_event_appearance(event_id: int, db: Session = Depends(get_db)):
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
     return _appearance_payload(event)
+
+
+@app.get("/api/evidence/{event_id}/image")
+def get_evidence_image(event_id: int, kind: str = Query("privacy"), db: Session = Depends(get_db)):
+    """Serve privacy-safe evidence by default; original images are RBAC-gated."""
+    if kind not in {"privacy", "original"}:
+        raise HTTPException(status_code=422, detail="kind must be privacy or original")
+    event = db.get(PlateEvent, event_id)
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    if kind == "privacy" and not event.privacy_image_path and event.image_path:
+        source = _sensitive_event_value(event, "original_image_path")
+        if not source and str(event.image_path).startswith("/uploads/"):
+            source = os.path.join(UPLOAD_DIR, os.path.basename(event.image_path))
+        if source and os.path.isfile(source):
+            filename = os.path.basename(source)
+            privacy_url, privacy_status, privacy_meta = asyncio.run(_create_privacy_derivative(source, filename, json.dumps([{
+                "bbox": {"x": event.bbox_x, "y": event.bbox_y, "width": event.bbox_width, "height": event.bbox_height}
+            }]) if event.bbox_x is not None else "[]"))
+            event.privacy_image_path = privacy_url
+            event.privacy_status = privacy_status
+            event.privacy_metadata = metadata_json(privacy_meta)
+            event.privacy_processed_at = datetime.datetime.utcnow()
+            db.commit()
+    path = _resolve_event_image(event, kind)
+    if not path:
+        raise HTTPException(status_code=404, detail="Evidence image not available")
+    return FileResponse(path)
+
+
+@app.get("/uploads/{file_path:path}")
+def get_upload_file(file_path: str):
+    """Serve derived evidence only after RBAC middleware authorizes the request."""
+    if os.path.isabs(file_path) or ".." in file_path.replace("\\", "/").split("/"):
+        raise HTTPException(status_code=404, detail="File not found")
+    path = resolve_under_root(UPLOAD_DIR, file_path)
+    if not path:
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(path)
 
 
 @app.get("/api/appearance/similarity")

@@ -18,6 +18,11 @@
   .stat .n { font-size:20px; font-weight:700; }
   .stat .l { font-size:11px; color:var(--muted); }
   .header-actions { display:flex; align-items:center; gap:14px; }
+  .auth-box { display:flex; align-items:center; gap:8px; flex-wrap:wrap; font-size:12px; color:var(--muted); }
+  .auth-box input { width:130px; min-width:0; padding:8px; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:7px; }
+  .auth-box button, .audit-actions button { padding:8px 10px; background:var(--accent); color:var(--text); border:0; border-radius:7px; cursor:pointer; font:inherit; font-size:12px; }
+  .auth-box button.secondary { background:transparent; border:1px solid var(--border); color:var(--text); }
+  .auth-role { color:var(--text); font-weight:700; }
   .clear-button { padding:10px 12px; background:transparent; color:var(--bad); border:1px solid rgba(217,83,79,0.5); border-radius:7px; cursor:pointer; font:inherit; font-size:12px; }
   .clear-button:hover { background:rgba(217,83,79,0.12); }
   main { display:grid; grid-template-columns: 320px 1fr; gap:0; min-height:calc(100vh - 78px); }
@@ -85,11 +90,19 @@
     <div class="sub">Live feed from phone-based demo cameras</div>
   </div>
   <div class="header-actions">
+    <div class="auth-box" id="authBox">
+      <span id="sessionSummary">Not signed in</span>
+      <input id="loginUsername" autocomplete="username" placeholder="admin_demo">
+      <input id="loginPassword" type="password" autocomplete="current-password" placeholder="Demo password">
+      <button id="loginBtn" type="button">Login</button>
+      <button id="logoutBtn" class="secondary" type="button" hidden>Logout</button>
+    </div>
     <a class="hotlist-link" href="hotlist.html">Hotlist &amp; alerts</a>
     <div class="stats">
       <div class="stat"><div class="n" id="statScans">0</div><div class="l">scans</div></div>
       <div class="stat"><div class="n" id="statVehicles">0</div><div class="l">vehicles</div></div>
       <div class="stat"><div class="n" id="statReview">0</div><div class="l">needs review</div></div>
+      <div class="stat"><div class="n" id="statSecurity">DEV</div><div class="l">security</div></div>
     </div>
     <button class="clear-button" id="clearHistory" type="button">Clear scan history</button>
   </div>
@@ -128,6 +141,33 @@
     <div id="trafficAnalytics" class="review-list">
       <div class="empty">Traffic analytics will appear after observations are available.</div>
     </div>
+    <h2>Edge &amp; Scalability</h2>
+    <div id="edgeScalability" class="review-list">
+      <div class="empty">Edge processing metrics will appear after the backend is reachable.</div>
+    </div>
+    <div id="edgeAdminControls" class="search-wrap" hidden>
+      <div class="incident-note">SIMULATION / DEMO only: generates lightweight metadata observations; it does not connect 500 physical cameras or upload continuous raw video.</div>
+      <div class="audit-actions" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+        <button id="simulateEdgeBtn" type="button">Run 500 Camera Simulation</button>
+        <button id="retentionDryRunBtn" type="button">Retention Dry Run</button>
+      </div>
+      <div id="edgeAdminStatus" class="meta" style="margin-top:10px"></div>
+    </div>
+    <h2>Smart Traffic Signals</h2>
+    <div id="smartSignals" class="review-list">
+      <div class="empty">Signal recommendations will appear after traffic analytics are available.</div>
+    </div>
+    <div id="signalControls" class="search-wrap" hidden>
+      <div class="incident-note">SIMULATION MODE - NO REAL TRAFFIC SIGNAL CONTROL. Recommendations are prototype timing guidance for the SIH demo.</div>
+      <div class="audit-actions" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+        <button id="signalRecommendBtn" type="button">Generate Recommendation</button>
+        <button id="signalStartBtn" type="button">Start Simulation</button>
+        <button id="signalTickBtn" type="button">Tick 10s</button>
+        <button id="signalStopBtn" type="button">Stop</button>
+        <button id="signalResetBtn" type="button">Reset</button>
+      </div>
+      <div id="signalStatus" class="meta" style="margin-top:10px"></div>
+    </div>
     <h2>Law Enforcement / PCR Alerts</h2>
     <div id="incidentList" class="review-list">
       <div class="empty">No active hotlist incidents.</div>
@@ -162,6 +202,16 @@
     <div id="routeAnomalyList" class="review-list">
       <div class="empty">No route anomalies.</div>
     </div>
+    <h2 id="adminAuditHeading" hidden>Admin audit</h2>
+    <div id="adminAuditSection" class="search-wrap" hidden>
+      <div class="incident-note">Tamper-evident application-level audit logging using SHA-256 hash chaining.</div>
+      <div class="audit-actions" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+        <button id="loadAuditBtn" type="button">View audit records</button>
+        <button id="verifyAuditBtn" type="button">Verify audit chain</button>
+      </div>
+      <div id="auditStatus" class="meta" style="margin-top:10px"></div>
+      <div id="auditList" class="search-results"></div>
+    </div>
     <h2>Fuzzy GIS search</h2>
     <div class="search-wrap">
       <div class="search-row">
@@ -194,6 +244,7 @@
 </main>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="auth.js"></script>
 <script src="reconnecting-socket.js"></script>
 <script src="hotlist-alerts.js"></script>
 <script>
@@ -228,31 +279,108 @@ let enforcementLayer = null;
 let trafficHeatmap = [];
 let lawIncidents = [];
 let pcrVehicles = [];
+let currentUser = null;
+let refreshTimer = null;
+let selectedSignalJunction = null;
+let latestSignalRecommendation = null;
 const liveFrame = document.getElementById("liveFrame");
 const overlay = document.getElementById("overlay");
 const streamEmpty = document.getElementById("streamEmpty");
 
 async function fetchJSON(path) {
   const res = await fetchWithTimeout(`${API_BASE}${path}`);
+  if (res.status === 401) handleUnauthenticated();
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
 }
 
+function authHeaders(extra = {}) {
+  return extra;
+}
+
+function authFetch(url, options = {}, timeoutMs = 3500) {
+  return fetchWithTimeout(url, {
+    ...options,
+    credentials: "include",
+    headers: authHeaders(options.headers || {}),
+  }, timeoutMs);
+}
+
 function fetchWithTimeout(url, options = {}, timeoutMs = 3500) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(new DOMException("Request timed out", "TimeoutError")), timeoutMs);
-  return fetch(url, { ...options, signal: controller.signal })
-    .finally(() => clearTimeout(timeout));
+  const path = url.startsWith(API_BASE) ? url.slice(API_BASE.length) : url;
+  return ANPRAuth.request(path, { ...options, headers: authHeaders(options.headers || {}) }, timeoutMs);
+}
+
+function roleCan(permission) {
+  if (!currentUser) return false;
+  if (currentUser.role === "SYSTEM_ADMIN") return true;
+  const allowed = {
+    TRAFFIC_OPERATOR: ["traffic", "vehicle", "review", "hotlist", "incident-read", "signal"],
+    PCR_OFFICER: ["pcr", "incident", "vehicle", "hotlist"],
+  }[currentUser.role] || [];
+  return allowed.includes(permission);
+}
+
+function applyRoleUI() {
+  const signedIn = Boolean(currentUser);
+  const summary = document.getElementById("sessionSummary");
+  summary.innerHTML = signedIn
+    ? `${currentUser.username} <span class="auth-role">${currentUser.role.replaceAll("_", " ")}</span>`
+    : "Not signed in";
+  document.getElementById("loginUsername").hidden = signedIn;
+  document.getElementById("loginPassword").hidden = signedIn;
+  document.getElementById("loginBtn").hidden = signedIn;
+  document.getElementById("logoutBtn").hidden = !signedIn;
+  document.getElementById("clearHistory").hidden = currentUser?.role !== "SYSTEM_ADMIN";
+  document.getElementById("adminAuditHeading").hidden = currentUser?.role !== "SYSTEM_ADMIN";
+  document.getElementById("adminAuditSection").hidden = currentUser?.role !== "SYSTEM_ADMIN";
+  document.getElementById("pcrLocationForm").hidden = !(roleCan("pcr") || currentUser?.role === "SYSTEM_ADMIN");
+  document.getElementById("edgeAdminControls").hidden = currentUser?.role !== "SYSTEM_ADMIN";
+  document.getElementById("signalControls").hidden = !(roleCan("signal") || currentUser?.role === "SYSTEM_ADMIN");
+}
+
+async function login(username, password) {
+  currentUser = await ANPRAuth.login(username, password);
+  applyRoleUI();
+  return currentUser;
+}
+
+async function loadSession() {
+  try {
+    currentUser = await ANPRAuth.loadSession();
+    applyRoleUI();
+    return Boolean(currentUser);
+  } catch (error) {
+    currentUser = null;
+    applyRoleUI();
+    return false;
+  }
+}
+
+function handleUnauthenticated() {
+  currentUser = null;
+  applyRoleUI();
+  eventSocket?.close();
+  cameraSocket?.close();
+  eventSocket = null;
+  cameraSocket = null;
+  clearInterval(snapshotTimer);
+  if (refreshTimer) clearInterval(refreshTimer);
+  refreshTimer = null;
 }
 
 function connectEventSocket() {
-  if (eventSocket && !eventSocket.stopped) return;
+  if (!currentUser || (eventSocket && !eventSocket.stopped)) return;
   const wsBase = API_BASE.replace(/^http/, "ws");
   eventSocket = new ANPRSocket(`${wsBase}/ws/events`, {
     onMessage: data => {
+      if (data.type === "anpr_scan") renderLiveScan(data.data);
       if (["event_created", "events_created", "event_corrected", "events_cleared", "match_reviewed"].includes(data.type)) refresh();
       if (data.type === "law_enforcement_alert") loadLawEnforcementIncidents();
+      if (["signal_state", "signal_recommendation"].includes(data.type)) loadSmartSignals();
     },
+    onState: state => { if (state === "unauthorized") handleUnauthenticated(); },
+    shouldReconnect: () => Boolean(currentUser),
   });
 }
 
@@ -403,14 +531,18 @@ async function loadTrafficAnalytics() {
   const busiestRoad = summary.busiest_road;
   const flows = (data.flow || []).slice(0, 4);
   const od = (data.od_matrix || []).slice(0, 4);
-  const congested = (data.congestion || []).slice(0, 4);
+  const congested = (data.congestion || []).filter(item => item.average_estimated_speed_kmh != null).slice(0, 4);
+  const summaryLines = [
+    summary.average_road_speed_kmh != null ? `Average road speed: ${Number(summary.average_road_speed_kmh).toFixed(1)} km/h` : "",
+    summary.lane_analysis_available && summary.lane_analysis_label ? `Lane analysis: ${summary.lane_analysis_label}` : "",
+  ].filter(Boolean).join(" · ");
   box.innerHTML = `
     <div class="review-item" style="grid-template-columns:1fr">
       <div class="review-body">
         <div class="plate">${summary.total_observations || 0} observations · ${summary.unique_vehicle_count || 0} unique vehicles</div>
         <div class="meta">Busiest camera: ${busiestCamera ? `${busiestCamera.camera_id} (${busiestCamera.observation_count})` : "none"}</div>
         <div class="meta">Busiest road: ${busiestRoad ? `${busiestRoad.source_camera_id} → ${busiestRoad.destination_camera_id} (${busiestRoad.movement_count})` : "none"}</div>
-        <div class="meta">Average road speed: ${summary.average_road_speed_kmh != null ? `${Number(summary.average_road_speed_kmh).toFixed(1)} km/h` : "not available"} · Lane analysis ${summary.lane_analysis || "not configured"}</div>
+        ${summaryLines ? `<div class="meta">${summaryLines}</div>` : ""}
       </div>
     </div>
     <div class="review-item" style="grid-template-columns:1fr">
@@ -429,8 +561,97 @@ async function loadTrafficAnalytics() {
       <div class="review-body">
         <div class="plate">Congestion</div>
         ${congested.length ? congested.map(item => `
-          <div class="meta"><span class="badge ${trafficBadge(item.congestion_status)}">${item.congestion_status}</span> ${item.source_camera_id} → ${item.destination_camera_id}: ${item.average_estimated_speed_kmh != null ? `${Number(item.average_estimated_speed_kmh).toFixed(1)} km/h` : "speed unavailable"} · ${item.movement_count} movement(s)</div>
+          <div class="meta"><span class="badge ${trafficBadge(item.congestion_status)}">${item.congestion_status}</span> ${item.source_camera_id} → ${item.destination_camera_id}: ${Number(item.average_estimated_speed_kmh).toFixed(1)} km/h · ${item.movement_count} movement(s)</div>
         `).join("") : `<div class="meta">No road-speed data yet.</div>`}
+      </div>
+    </div>
+  `;
+}
+
+async function loadEdgeScalability() {
+  const box = document.getElementById("edgeScalability");
+  if (!roleCan("traffic") && currentUser?.role !== "SYSTEM_ADMIN") {
+    box.innerHTML = `<div class="empty">Edge health is restricted for this role.</div>`;
+    return;
+  }
+  const data = await fetchJSON("/api/edge/status");
+  const simulation = data.simulation || {};
+  box.innerHTML = `
+    <div class="review-item" style="grid-template-columns:1fr">
+      <div class="review-body">
+        <div class="plate">${data.online_cameras || 0}/${data.registered_cameras || 0} cameras online</div>
+        <div class="meta">${data.degraded_cameras || 0} degraded · ${data.offline_cameras || 0} offline · ${data.edge_devices || 0} edge device(s)</div>
+        <div class="meta">Queue ${data.queue?.mode || "local"} · backlog ${data.queue?.depth || 0} · workers ${data.queue?.worker_count || 1}</div>
+      </div>
+    </div>
+    <div class="review-item" style="grid-template-columns:1fr">
+      <div class="review-body">
+        <div class="plate">${data.observations_per_minute || 0} obs/min · ${data.processing_throughput_per_minute || 0} processed/min</div>
+        <div class="meta">${data.observations_processed || 0} processed · ${data.observations_failed || 0} failed · ${data.duplicate_observations || 0} duplicate</div>
+        <div class="meta">Latency avg ${Number(data.average_processing_latency_ms || 0).toFixed(0)} ms · max ${Number(data.maximum_processing_latency_ms || 0).toFixed(0)} ms</div>
+      </div>
+    </div>
+    <div class="review-item" style="grid-template-columns:1fr">
+      <div class="review-body">
+        <div class="plate">${simulation.active ? "Simulation Mode Active" : "Simulation Mode"}</div>
+        <div class="meta">SIMULATION / DEMO · ${simulation.metrics?.camera_count || 0} configured camera(s) · ${simulation.metrics?.generated || 0} generated observation(s)</div>
+        <div class="meta">Sampling every ${data.sampling?.sampling_interval || 1} frame(s) · effective ${Number(data.sampling?.effective_processing_fps || 0).toFixed(1)} FPS</div>
+      </div>
+    </div>
+  `;
+}
+
+async function loadSmartSignals() {
+  const box = document.getElementById("smartSignals");
+  if (!roleCan("signal") && currentUser?.role !== "SYSTEM_ADMIN") {
+    box.innerHTML = `<div class="empty">Signal recommendations are restricted for this role.</div>`;
+    selectedSignalJunction = null;
+    latestSignalRecommendation = null;
+    return;
+  }
+  const junctions = await fetchJSON("/api/signals/junctions");
+  const junction = junctions[0];
+  if (!junction) {
+    box.innerHTML = `<div class="empty">No signal junctions configured.</div>`;
+    return;
+  }
+  selectedSignalJunction = junction.junction_id;
+  const demand = await fetchJSON(`/api/signals/junctions/${encodeURIComponent(junction.junction_id)}/demand`);
+  const sim = await fetchJSON(`/api/signals/simulation/${encodeURIComponent(junction.junction_id)}`);
+  const recommendations = await fetchJSON(`/api/signals/recommendations?junction_id=${encodeURIComponent(junction.junction_id)}&limit=1`);
+  latestSignalRecommendation = recommendations.items?.[0] || null;
+  const movements = Array.isArray(demand.movements) ? demand.movements : Object.values(demand.movements || {});
+  const movementRows = movements.map(item => `
+    <div class="meta">
+      <span class="badge ${item.demand_score >= 0.7 ? "bad" : item.demand_score >= 0.4 ? "warn" : "ok"}">${item.movement}</span>
+      demand ${Number(item.demand_score || 0).toFixed(2)} · ${item.observation_count || 0} obs · congestion ${Number(item.congestion_score || 0).toFixed(2)}
+    </div>
+  `).join("") || `<div class="meta">Insufficient traffic observations for movement scoring.</div>`;
+  const recommended = latestSignalRecommendation?.recommendation || {};
+  const phaseSummary = (recommended.phases || []).map(phase =>
+    `${phase.movement}: ${phase.green_seconds}s green`
+  ).join(" · ") || "Generate a recommendation to calculate green time.";
+  const reason = recommended.explanation?.summary || "No recommendation generated yet.";
+  box.innerHTML = `
+    <div class="review-item" style="grid-template-columns:1fr">
+      <div class="review-body">
+        <div class="plate">${junction.name}</div>
+        <div class="meta">SIMULATION MODE - NO REAL TRAFFIC SIGNAL CONTROL</div>
+        <div class="meta">${junction.camera_ids.length || 0} camera(s) · controller ${junction.controller.mode} · ${junction.active ? "active" : "inactive"}</div>
+      </div>
+    </div>
+    <div class="review-item" style="grid-template-columns:1fr">
+      <div class="review-body">
+        <div class="plate">${sim.active ? sim.current_phase_id : "Simulation stopped"}</div>
+        <div class="meta">${sim.phase_kind || "IDLE"} · ${sim.remaining_seconds || 0}s remaining · ${sim.mode || "SIMULATION MODE"}</div>
+        <div class="meta">${phaseSummary}</div>
+      </div>
+    </div>
+    <div class="review-item" style="grid-template-columns:1fr">
+      <div class="review-body">
+        <div class="plate">Data quality: ${demand.data_quality}</div>
+        ${movementRows}
+        <div class="meta">${reason}</div>
       </div>
     </div>
   `;
@@ -497,7 +718,7 @@ async function loadLawEnforcementIncidents() {
   list.querySelectorAll("button[data-status]").forEach(button => {
     button.addEventListener("click", async () => {
       const item = button.closest(".incident-item");
-      const response = await fetch(`${API_BASE}/api/incidents/${item.dataset.incidentId}/status`, {
+      const response = await authFetch(`${API_BASE}/api/incidents/${item.dataset.incidentId}/status`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ status: button.dataset.status, updated_by: "dashboard" }),
@@ -682,7 +903,7 @@ function renderInvestigation(data) {
 
 async function reviewInvestigationItem(kind, id, status) {
   const path = kind === "plate" ? `/api/plate-suspicions/${id}/review` : `/api/route-anomalies/${id}/review`;
-  const response = await fetch(`${API_BASE}${path}`, {
+  const response = await authFetch(`${API_BASE}${path}`, {
     method: "PATCH",
     headers: {"Content-Type": "application/json"},
     body: JSON.stringify({ status, reviewed_by: "dashboard" }),
@@ -710,6 +931,7 @@ function drawOverlay(result) {
 }
 
 function selectCamera(cameraId) {
+  if (!currentUser) return;
   selectedCamera = cameraId;
   if (cameraSocket) cameraSocket.close();
   streamConnected = false;
@@ -733,10 +955,6 @@ function selectCamera(cameraId) {
     }
   }, 1000);
   cameraSocket = new ANPRSocket(`${wsBase}/ws/cameras/${encodeURIComponent(cameraId)}`, {
-    onState: state => {
-      document.getElementById("streamStatus").textContent = state;
-      document.getElementById("streamStatus").className = `badge ${state === "connected" ? "ok" : "warn"}`;
-    },
     onMessage: data => {
       streamConnected = data.status === "connected";
       if (streamConnected) {
@@ -749,6 +967,12 @@ function selectCamera(cameraId) {
       document.getElementById("streamStatus").textContent = data.status;
       drawOverlay(data.result);
     },
+    onState: state => {
+      document.getElementById("streamStatus").textContent = state;
+      document.getElementById("streamStatus").className = `badge ${state === "connected" ? "ok" : "warn"}`;
+      if (state === "unauthorized") handleUnauthenticated();
+    },
+    shouldReconnect: () => Boolean(currentUser),
   });
   const camera = cameras.find(item => item.camera_id === cameraId);
   document.getElementById("cameraLat").value = camera?.lat ?? "";
@@ -786,6 +1010,28 @@ async function loadVehicles() {
   });
 
   if (!selectedPlate && vehicles.length) selectVehicle(vehicles[0].plate_text, vehicles[0].global_vehicle_id || vehicles[0].vehicle_id);
+}
+
+function renderLiveScan(scan) {
+  if (!scan?.plate_text || scan.status !== "ok") return;
+  const list = document.getElementById("vehicleList");
+  const plate = scan.plate_text;
+  list.querySelector(".empty")?.remove();
+  list.querySelectorAll(`[data-live-scan="${plate}"]`).forEach(item => item.remove());
+  const item = document.createElement("div");
+  item.className = `vehicle-item ${plate === selectedPlate ? "active" : ""}`;
+  item.dataset.plate = plate;
+  item.dataset.vehicleId = scan.global_vehicle_id || scan.vehicle_id || "";
+  item.dataset.liveScan = plate;
+  item.innerHTML = `
+    <div class="plate">${plate}</div>
+    <div class="meta">Live scan · ${scan.camera_label || scan.camera_id || "camera"} · ${Math.round((scan.confidence || 0) * 100)}%</div>
+    <div class="meta">Saving evidence...</div>
+  `;
+  item.addEventListener("click", () => {
+    if (item.dataset.vehicleId) selectVehicle(plate, item.dataset.vehicleId);
+  });
+  list.prepend(item);
 }
 
 function trajectoryUrl(plate) {
@@ -834,6 +1080,13 @@ async function loadStats() {
   document.getElementById("statScans").textContent = s.total_scans;
   document.getElementById("statVehicles").textContent = s.unique_vehicles;
   document.getElementById("statReview").textContent = s.needs_review;
+  try {
+    const security = await fetchJSON("/api/security/status");
+    document.getElementById("statSecurity").textContent = security.encryption_at_rest === "CONFIGURED" ? "HARD" : "DEV";
+    document.getElementById("statSecurity").title = `Auth ${security.authentication}; RBAC ${security.rbac}; Audit ${security.audit_chain}; TLS ${security.https_tls}`;
+  } catch {
+    document.getElementById("statSecurity").textContent = "WARN";
+  }
 }
 
 async function loadReviewQueue() {
@@ -846,7 +1099,7 @@ async function loadReviewQueue() {
   }
   list.innerHTML = pending.map(event => `
     <div class="review-item" data-event-id="${event.event_id}">
-      ${event.image_path ? `<img src="${API_BASE}${event.image_path}" alt="Plate scan requiring review">` : ""}
+      ${event.image_path ? `<img src="${API_BASE}${event.image_path}" alt="Privacy-safe plate scan requiring review">` : ""}
       <div class="review-body">
         <div class="plate">${event.plate_text || "Unreadable"}</div>
         <div class="meta">${event.camera_id} · ${event.confidence != null ? Math.round(event.confidence * 100) : 0}% confidence${event.plate_category ? ` · ${event.plate_category}` : ""}${event.layout ? ` · ${event.layout}` : ""}</div>
@@ -873,7 +1126,7 @@ async function loadReviewQueue() {
       } else {
         const form = new FormData();
         form.append("corrected_text", value);
-        const response = await fetch(`${API_BASE}/api/events/${item.dataset.eventId}/correct`, {
+        const response = await authFetch(`${API_BASE}/api/events/${item.dataset.eventId}/correct`, {
           method: "POST",
           body: form,
         });
@@ -898,7 +1151,7 @@ async function loadMatchQueue() {
     const plate = match.plate_evidence?.used ? `${Math.round((match.plate_evidence.similarity || 0) * 100)}% plate` : "No valid plate evidence";
     return `
       <div class="review-item" data-match-id="${match.match_id}">
-        ${b.vehicle_crop_path || b.image_path ? `<img src="${API_BASE}${b.vehicle_crop_path || b.image_path}" alt="Candidate vehicle observation">` : ""}
+        ${b.vehicle_crop_path || b.image_path ? `<img src="${API_BASE}${b.vehicle_crop_path || b.image_path}" alt="Privacy-safe candidate vehicle observation">` : ""}
         <div class="review-body">
           <div class="plate">${pct}% · ${match.state}</div>
           <div class="meta">${a.camera_id || "CAM?"} → ${b.camera_id || "CAM?"} · ${plate} · ${appearance}</div>
@@ -915,7 +1168,7 @@ async function loadMatchQueue() {
   list.querySelectorAll(".review-item button").forEach(button => {
     button.addEventListener("click", async () => {
       const item = button.closest(".review-item");
-      const response = await fetch(`${API_BASE}/api/matches/${item.dataset.matchId}/review`, {
+      const response = await authFetch(`${API_BASE}/api/matches/${item.dataset.matchId}/review`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: button.dataset.action }),
@@ -968,7 +1221,7 @@ async function loadPlateSuspicionQueue() {
   list.querySelectorAll("button").forEach(button => {
     button.addEventListener("click", async () => {
       const item = button.closest(".review-item");
-      const response = await fetch(`${API_BASE}/api/plate-suspicions/${item.dataset.suspicionId}/review`, {
+      const response = await authFetch(`${API_BASE}/api/plate-suspicions/${item.dataset.suspicionId}/review`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ status: button.dataset.status }),
@@ -1007,7 +1260,7 @@ async function loadRouteAnomalyQueue() {
   list.querySelectorAll("button").forEach(button => {
     button.addEventListener("click", async () => {
       const item = button.closest(".review-item");
-      const response = await fetch(`${API_BASE}/api/route-anomalies/${item.dataset.routeAnomalyId}/review`, {
+      const response = await authFetch(`${API_BASE}/api/route-anomalies/${item.dataset.routeAnomalyId}/review`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ status: button.dataset.status }),
@@ -1075,7 +1328,7 @@ async function searchSightings() {
 
 async function clearHistory() {
   if (!confirm("Delete all scan history and uploaded scan images? Camera settings will be kept.")) return;
-  const response = await fetch(`${API_BASE}/api/events`, { method: "DELETE" });
+  const response = await authFetch(`${API_BASE}/api/events`, { method: "DELETE" });
   if (!response.ok) {
     alert("Could not clear scan history.");
     return;
@@ -1088,7 +1341,144 @@ async function clearHistory() {
   await refresh();
 }
 
+async function loadAuditRecords() {
+  const list = document.getElementById("auditList");
+  const status = document.getElementById("auditStatus");
+  status.textContent = "Loading audit records...";
+  const data = await fetchJSON("/api/audit?limit=25");
+  status.textContent = `${data.total} audit record${data.total === 1 ? "" : "s"} stored`;
+  list.innerHTML = (data.items || []).map(item => `
+    <div class="search-hit">
+      <div>
+        <div class="plate">${item.action}</div>
+        <div class="meta">${item.username || "anonymous"} · ${item.role || "no role"} · ${item.resource_type || "resource"} ${item.resource_id || ""}</div>
+      </div>
+      <div class="meta" style="text-align:right;">
+        ${item.success ? "success" : "failure"}<br>
+        ${item.timestamp ? new Date(item.timestamp).toLocaleString() : ""}
+      </div>
+    </div>
+  `).join("") || `<div class="empty">No audit records yet.</div>`;
+}
+
+async function verifyAuditChain() {
+  const status = document.getElementById("auditStatus");
+  const data = await fetchJSON("/api/audit/verify");
+  status.textContent = data.valid
+    ? `Audit chain valid. ${data.records_checked} record(s) checked.`
+    : `Audit chain invalid at record ${data.first_invalid_record}: ${data.reason}`;
+}
+
 document.getElementById("clearHistory").addEventListener("click", clearHistory);
+document.getElementById("loadAuditBtn").addEventListener("click", () => loadAuditRecords().catch(error => {
+  document.getElementById("auditStatus").textContent = error.message;
+}));
+document.getElementById("verifyAuditBtn").addEventListener("click", () => verifyAuditChain().catch(error => {
+  document.getElementById("auditStatus").textContent = error.message;
+}));
+document.getElementById("simulateEdgeBtn").addEventListener("click", async () => {
+  const status = document.getElementById("edgeAdminStatus");
+  status.textContent = "Running SIMULATION / DEMO metadata load...";
+  try {
+    const response = await authFetch(`${API_BASE}/api/edge/simulation/start`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ camera_count: 500, observation_rate: 1, duration_seconds: 1, duplicate_rate: 0.02, failure_rate: 0.01 }),
+    }, 60000);
+    const data = await response.json();
+    status.textContent = `Simulation generated ${data.metrics?.generated || 0} observation(s).`;
+    await loadEdgeScalability();
+  } catch (error) {
+    status.textContent = error.message;
+  }
+});
+document.getElementById("retentionDryRunBtn").addEventListener("click", async () => {
+  const status = document.getElementById("edgeAdminStatus");
+  status.textContent = "Checking raw-image retention dry run...";
+  try {
+    const response = await authFetch(`${API_BASE}/api/retention/run`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ dry_run: true }),
+    }, 30000);
+    const data = await response.json();
+    status.textContent = `Dry run found ${data.eligible_raw_images || 0} expired raw image(s).`;
+  } catch (error) {
+    status.textContent = error.message;
+  }
+});
+async function signalAction(path, body = {}) {
+  if (!selectedSignalJunction) await loadSmartSignals();
+  const status = document.getElementById("signalStatus");
+  status.textContent = "Updating signal simulation...";
+  const response = await authFetch(`${API_BASE}${path}`, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(body),
+  }, 10000);
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`);
+  status.textContent = data.mode || data.status || "Signal action completed.";
+  await loadSmartSignals();
+  return data;
+}
+document.getElementById("signalRecommendBtn").addEventListener("click", async () => {
+  try {
+    latestSignalRecommendation = await signalAction("/api/signals/recommendation", { junction_id: selectedSignalJunction || "JUNC-DEMO-01" });
+    document.getElementById("signalStatus").textContent = `Recommendation ${latestSignalRecommendation.recommendation_id} generated.`;
+  } catch (error) {
+    document.getElementById("signalStatus").textContent = error.message;
+  }
+});
+document.getElementById("signalStartBtn").addEventListener("click", async () => {
+  try {
+    await signalAction(`/api/signals/simulation/${encodeURIComponent(selectedSignalJunction || "JUNC-DEMO-01")}/start`, {
+      recommendation_id: latestSignalRecommendation?.recommendation_id,
+    });
+  } catch (error) {
+    document.getElementById("signalStatus").textContent = error.message;
+  }
+});
+document.getElementById("signalTickBtn").addEventListener("click", async () => {
+  try {
+    await signalAction(`/api/signals/simulation/${encodeURIComponent(selectedSignalJunction || "JUNC-DEMO-01")}/tick`, { seconds: 10 });
+  } catch (error) {
+    document.getElementById("signalStatus").textContent = error.message;
+  }
+});
+document.getElementById("signalStopBtn").addEventListener("click", async () => {
+  try {
+    await signalAction(`/api/signals/simulation/${encodeURIComponent(selectedSignalJunction || "JUNC-DEMO-01")}/stop`);
+  } catch (error) {
+    document.getElementById("signalStatus").textContent = error.message;
+  }
+});
+document.getElementById("signalResetBtn").addEventListener("click", async () => {
+  try {
+    await signalAction(`/api/signals/simulation/${encodeURIComponent(selectedSignalJunction || "JUNC-DEMO-01")}/reset`);
+  } catch (error) {
+    document.getElementById("signalStatus").textContent = error.message;
+  }
+});
+document.getElementById("loginBtn").addEventListener("click", async () => {
+  const username = document.getElementById("loginUsername").value.trim();
+  const password = document.getElementById("loginPassword").value;
+  try {
+    await login(username, password);
+    eventSocket?.close();
+    cameraSocket?.close();
+    eventSocket = null;
+    cameraSocket = null;
+    await startAuthenticatedDashboard();
+  } catch (error) {
+    document.getElementById("sessionSummary").textContent = "Login failed";
+  }
+});
+document.getElementById("logoutBtn").addEventListener("click", async () => {
+  try { await ANPRAuth.logout(); } catch (error) {}
+  currentUser = null;
+  handleUnauthenticated();
+});
 document.getElementById("searchBtn").addEventListener("click", searchSightings);
 document.getElementById("searchPlate").addEventListener("keydown", event => {
   if (event.key === "Enter") searchSightings();
@@ -1103,6 +1493,7 @@ document.getElementById("investigationPanel").addEventListener("click", async ev
 });
 
 async function refresh() {
+  if (!currentUser) return;
   if (refreshing) return;
   refreshing = true;
   try {
@@ -1118,6 +1509,8 @@ async function refresh() {
   try { await loadStats(); } catch (error) {}
   try { await loadRoadNetwork(); } catch (error) {}
   try { await loadTrafficAnalytics(); } catch (error) {}
+  try { await loadEdgeScalability(); } catch (error) {}
+  try { await loadSmartSignals(); } catch (error) {}
   try { await loadLawEnforcementIncidents(); } catch (error) {}
   try { await loadReviewQueue(); } catch (error) {}
   try { await loadMatchQueue(); } catch (error) {}
@@ -1158,7 +1551,7 @@ document.getElementById("locationForm").addEventListener("submit", async event =
   const status = document.getElementById("locationStatus");
   if ((lat === "") !== (lng === "")) { status.textContent = "Enter both coordinates."; return; }
   try {
-    const response = await fetch(`${API_BASE}/api/cameras/${encodeURIComponent(selectedCamera)}`, {
+    const response = await authFetch(`${API_BASE}/api/cameras/${encodeURIComponent(selectedCamera)}`, {
       method: "PATCH", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ lat: lat === "" ? null : Number(lat), lng: lng === "" ? null : Number(lng) }),
     });
@@ -1180,7 +1573,7 @@ document.getElementById("pcrLocationForm").addEventListener("submit", async even
   const lat = Number(document.getElementById("pcrLat").value);
   const lng = Number(document.getElementById("pcrLng").value);
   try {
-    const response = await fetch(`${API_BASE}/api/pcr/${encodeURIComponent(pcrId)}/location`, {
+    const response = await authFetch(`${API_BASE}/api/pcr/${encodeURIComponent(pcrId)}/location`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ latitude: lat, longitude: lng, timestamp: new Date().toISOString() }),
@@ -1205,11 +1598,20 @@ document.getElementById("resetSearch").addEventListener("click", () => {
 });
 window.addEventListener("pagehide", () => { eventSocket?.close(); cameraSocket?.close(); clearInterval(snapshotTimer); });
 window.addEventListener("pageshow", event => {
-  if (event.persisted) { connectEventSocket(); if (selectedCamera) selectCamera(selectedCamera); }
+  if (event.persisted && currentUser) { connectEventSocket(); if (selectedCamera) selectCamera(selectedCamera); }
 });
-connectEventSocket();
-refresh();
-setInterval(refresh, 4000); // live polling — good enough for a demo
+async function startAuthenticatedDashboard() {
+  if (!currentUser) return;
+  connectEventSocket();
+  await refresh();
+  if (!refreshTimer) refreshTimer = setInterval(refresh, 4000);
+}
+ANPRAuth.onChange(user => {
+  currentUser = user;
+  applyRoleUI();
+  if (!user) handleUnauthenticated();
+});
+loadSession().then(ok => { if (ok) startAuthenticatedDashboard(); });
 </script>
 </body>
 </html>

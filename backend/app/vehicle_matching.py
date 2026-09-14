@@ -99,6 +99,10 @@ def compare_observations(left, right, camera_left=None, camera_right=None):
     thresholds = matching_thresholds()
     left_plate = _confirmed_plate(left)
     right_plate = _confirmed_plate(right)
+    relationship = _camera_relationship(camera_left, camera_right)
+    time_delta = None
+    if left.timestamp and right.timestamp:
+        time_delta = (right.timestamp - left.timestamp).total_seconds()
     factor_scores = {}
     plate_evidence = {
         "left_plate": left_plate,
@@ -107,6 +111,23 @@ def compare_observations(left, right, camera_left=None, camera_right=None):
         "exact": False,
         "similarity": None,
     }
+
+    if not left_plate or not right_plate:
+        return {
+            "plate_evidence": plate_evidence,
+            "appearance_similarity": None,
+            "vehicle_type_similarity": None,
+            "vehicle_color_similarity": None,
+            "time_delta_seconds": time_delta,
+            "spatial_relationship": relationship,
+            "factor_scores": {},
+            "factors_used": [],
+            "final_confidence": 0.0,
+            "state": LOW_CONFIDENCE,
+            "conflicting_vehicle_ids": False,
+            "matching_model": MATCHING_MODEL,
+            "matching_version": MATCHING_VERSION,
+        }
 
     if left_plate and right_plate:
         score = plate_similarity_score(left_plate, right_plate)
@@ -123,12 +144,9 @@ def compare_observations(left, right, camera_left=None, camera_right=None):
     if left.vehicle_color and right.vehicle_color:
         factor_scores["vehicle_color_similarity"] = 1.0 if left.vehicle_color == right.vehicle_color else 0.0
 
-    time_delta = None
-    if left.timestamp and right.timestamp:
-        time_delta = (right.timestamp - left.timestamp).total_seconds()
+    if time_delta is not None:
         factor_scores["time_consistency"] = _time_score(time_delta)
 
-    relationship = _camera_relationship(camera_left, camera_right)
     camera_factor = _camera_score(relationship)
     if camera_factor is not None:
         factor_scores["camera_relationship"] = camera_factor
@@ -241,20 +259,18 @@ def _upsert_match_candidate(db, previous, current, comparison):
 
 def _candidate_query(db, event):
     thresholds = matching_thresholds()
+    if not _confirmed_plate(event):
+        return []
     since = event.timestamp - datetime.timedelta(minutes=thresholds["lookback_minutes"])
     query = (
         db.query(PlateEvent)
         .filter(PlateEvent.id != event.id)
         .filter(PlateEvent.timestamp >= since)
         .filter(PlateEvent.timestamp <= event.timestamp)
+        .filter(PlateEvent.plate_text.isnot(None))
+        .filter(PlateEvent.status != PENDING_REVIEW_STATUS)
+        .filter(PlateEvent.confidence >= OCR_ACCEPT_CONFIDENCE)
     )
-    current_plate = _confirmed_plate(event)
-    if current_plate:
-        query = query.filter(or_(PlateEvent.plate_text.isnot(None), PlateEvent.appearance_embedding.isnot(None)))
-    elif event.appearance_embedding:
-        query = query.filter(PlateEvent.appearance_embedding.isnot(None))
-        if event.vehicle_color:
-            query = query.filter(or_(PlateEvent.vehicle_color == event.vehicle_color, PlateEvent.vehicle_color.is_(None)))
     return (
         query
         .order_by(PlateEvent.timestamp.desc(), PlateEvent.id.desc())
@@ -270,6 +286,8 @@ def process_observation_matches(db, event):
     cameras = {camera.camera_id: camera for camera in db.query(Camera).all()}
     matches = []
     for previous in _candidate_query(db, event):
+        if not _confirmed_plate(previous):
+            continue
         comparison = compare_observations(previous, event, cameras.get(previous.camera_id), cameras.get(event.camera_id))
         if comparison["state"] == LOW_CONFIDENCE:
             continue
@@ -289,7 +307,9 @@ def _event_summary(event):
         "confidence": event.confidence,
         "camera_id": event.camera_id,
         "timestamp": iso_utc(event.timestamp),
-        "image_path": event.image_path,
+        "image_path": event.privacy_image_path or f"/api/evidence/{event.id}/image?kind=privacy",
+        "privacy_image_path": event.privacy_image_path,
+        "original_image_available": bool(getattr(event, "original_image_path", None) or getattr(event, "original_image_path_ciphertext", None)),
         "vehicle_crop_path": event.vehicle_crop_path,
         "vehicle_type": event.vehicle_type,
         "vehicle_color": event.vehicle_color,

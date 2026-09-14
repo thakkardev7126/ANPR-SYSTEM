@@ -119,6 +119,9 @@ DETECT_IMGSZ = int(os.getenv("ANPR_DETECT_IMGSZ", "960"))
 MAX_OCR_DETECTIONS = int(os.getenv("ANPR_MAX_OCR_DETECTIONS", "4"))
 FAST_OCR_VARIANTS = int(os.getenv("ANPR_FAST_OCR_VARIANTS", "3"))
 MAX_FALLBACK_REGIONS = int(os.getenv("ANPR_MAX_FALLBACK_REGIONS", "3"))
+STOP_AFTER_STRONG_VALID_PLATE = os.getenv("ANPR_STOP_AFTER_STRONG_VALID_PLATE", "1") != "0"
+STRONG_VALID_DETECTION_CONFIDENCE = float(os.getenv("ANPR_STRONG_VALID_DETECTION_CONFIDENCE", "0.75"))
+STRONG_VALID_OCR_CONFIDENCE = float(os.getenv("ANPR_STRONG_VALID_OCR_CONFIDENCE", "0.90"))
 
 
 class LatestFrameBuffer:
@@ -587,6 +590,24 @@ def _mean_block_confidence(blocks):
     return sum(scores) / len(scores)
 
 
+def has_reviewable_ocr_text(candidate):
+    """True only when OCR saw plate-like characters worth human correction."""
+    if not candidate:
+        return False
+    text = (
+        candidate.get("raw_text")
+        or candidate.get("joined_text")
+        or candidate.get("text")
+        or ""
+    )
+    cleaned = sanitize_plate_text(str(text))
+    if not cleaned or (candidate.get("confidence") or 0.0) <= 0.0:
+        return False
+    if len(cleaned) > 12:
+        return False
+    return any(char.isdigit() for char in cleaned) or len(cleaned) <= 4
+
+
 def read_plate_text(crop_bgr, layout=None, max_variants=None):
     """Run PaddleOCR on a cropped plate region."""
     candidates = []
@@ -625,6 +646,7 @@ def read_plate_text(crop_bgr, layout=None, max_variants=None):
                     "confidence": 0.0,
                     "status": "failed",
                     "needs_review": True,
+                    "reviewable": False,
                     "valid_format": False,
                     "violations": [f"ocr_error:{exc}"],
                     "corrections": [],
@@ -654,6 +676,7 @@ def read_plate_text(crop_bgr, layout=None, max_variants=None):
                     "status": status_for_plate(combined_conf, rule_result),
                     "regex_status": "Passed" if regex_passed else "Needs Review",
                     "needs_review": not regex_passed,
+                    "reviewable": not regex_passed and bool(cleaned),
                     "valid_format": rule_result.valid_format,
                     "state_code": rule_result.state_code,
                     "district_code": rule_result.district_code,
@@ -674,6 +697,7 @@ def read_plate_text(crop_bgr, layout=None, max_variants=None):
                     "status": PENDING_REVIEW_STATUS,
                     "regex_status": "Needs Review",
                     "needs_review": True,
+                    "reviewable": True,
                     "valid_format": False,
                     "state_code": None,
                     "district_code": None,
@@ -710,6 +734,7 @@ def read_plate_text(crop_bgr, layout=None, max_variants=None):
                     "status": status_for_plate(combined_conf, rule_result),
                     "regex_status": "Passed" if status_for_plate(combined_conf, rule_result) != PENDING_REVIEW_STATUS else "Needs Review",
                     "needs_review": status_for_plate(combined_conf, rule_result) == PENDING_REVIEW_STATUS,
+                    "reviewable": status_for_plate(combined_conf, rule_result) == PENDING_REVIEW_STATUS,
                     "valid_format": rule_result.valid_format,
                     "state_code": rule_result.state_code,
                     "district_code": rule_result.district_code,
@@ -730,6 +755,7 @@ def read_plate_text(crop_bgr, layout=None, max_variants=None):
                     "status": PENDING_REVIEW_STATUS,
                     "regex_status": "Needs Review",
                     "needs_review": True,
+                    "reviewable": True,
                     "valid_format": False,
                     "state_code": None,
                     "district_code": None,
@@ -823,7 +849,7 @@ def fallback_ocr_regions(image_bgr):
     return contour_regions + bounded_regions
 
 
-def process_image(image_path):
+def process_image(image_path, stop_after_strong_valid=False):
     """
     Full pipeline for one uploaded photo.
     Returns: (plate_text, confidence, status, raw_candidates_json)
@@ -854,7 +880,8 @@ def process_image(image_path):
         crop_image_path = _save_debug_crop(image_path, crop, f"crop_{detection_index}") if crop_candidates else None
         if not crop_candidates:
             crop_candidates = [dict(text=None, confidence=0.0, status=PENDING_REVIEW_STATUS,
-                                    needs_review=True, violations=["unreadable_crop"], quality=assess_quality(crop))]
+                                    needs_review=True, reviewable=False,
+                                    violations=["unreadable_crop"], quality=assess_quality(crop))]
         for candidate in crop_candidates:
             candidate["detection_id"] = detection_index
             candidate["partial"] = bool(frame_edges)
@@ -877,6 +904,16 @@ def process_image(image_path):
             if candidate.get("regex_status") and not debug["regex_status"]:
                 debug["regex_status"] = candidate["regex_status"]
         all_candidates.extend(crop_candidates)
+        if stop_after_strong_valid and STOP_AFTER_STRONG_VALID_PLATE and isinstance(detection, dict):
+            detector_conf = float(detection.get("confidence") or 0.0)
+            strong_plate = any(
+                candidate.get("valid_format")
+                and candidate.get("status") != PENDING_REVIEW_STATUS
+                and (candidate.get("confidence") or 0.0) >= STRONG_VALID_OCR_CONFIDENCE
+                for candidate in crop_candidates
+            )
+            if strong_plate and detector_conf >= STRONG_VALID_DETECTION_CONFIDENCE:
+                break
 
     # Fallback: if the detector misses, try a few bounded plate-like regions so
     # uploads do not stall on full-resolution screenshots.

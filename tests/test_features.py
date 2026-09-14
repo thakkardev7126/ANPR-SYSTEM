@@ -4,6 +4,7 @@ import sys
 import tempfile
 import pathlib
 import json
+import base64
 import datetime as dt
 import asyncio
 import unittest
@@ -13,6 +14,7 @@ from unittest.mock import patch, MagicMock
 TEMP = tempfile.TemporaryDirectory(prefix="anpr-tests-")
 os.environ["ANPR_DATABASE_PATH"] = str(pathlib.Path(TEMP.name) / "tests.db")
 os.environ["ANPR_UPLOAD_DIR"] = str(pathlib.Path(TEMP.name) / "uploads")
+os.environ["ANPR_ORIGINAL_EVIDENCE_DIR"] = str(pathlib.Path(TEMP.name) / "evidence" / "originals")
 os.environ["ANPR_REVIEW_DIR"] = str(pathlib.Path(TEMP.name) / "review")
 os.environ["ANPR_APPEARANCE_BACKEND"] = "opencv"
 os.environ["ANPR_APPEARANCE_DEVICE"] = "cpu"
@@ -26,7 +28,11 @@ from app import anpr_pipeline as pipeline
 from app.plate_rules import normalize_plate_text, strip_hsrp_noise
 from app.image_quality import padded_plate_crop, normalize_size, assess_quality, enhanced_variants, PartialPlateHistory
 from app.location import resolve_location
-from app.database import SessionLocal, PlateEvent, Camera, CameraRoadConnection, Vehicle, VehicleMatchCandidate, VehicleAnomaly, PlateSuspicionEvent, RouteAnomalyEvent, persist_plate_event, engine, HotlistEntry, HotlistAlert, HotlistNotification, PCRVehicle, EnforcementIncident
+from app.database import SessionLocal, PlateEvent, Camera, CameraRoadConnection, Vehicle, VehicleMatchCandidate, VehicleAnomaly, PlateSuspicionEvent, RouteAnomalyEvent, persist_plate_event, engine, HotlistEntry, HotlistAlert, HotlistNotification, PCRVehicle, EnforcementIncident, AuditLog, User, EdgeDevice, EdgeObservation, RetentionRun, TrafficJunction, SignalPhase, SignalRecommendation, SignalSimulationState
+from app.audit import append_audit_log, verify_audit_chain
+from app.auth import hash_password
+from app.crypto import decrypt_sensitive, encrypt_sensitive, generate_key
+from app.privacy import create_privacy_safe_derivative
 from app.main import app
 from app.seed_cameras import seed
 from app.road_network import camera_transition
@@ -41,6 +47,7 @@ from app.vehicle_appearance import (
     serialize_embedding,
 )
 from app.vehicle_matching import compare_observations, process_observation_matches
+from app.edge import FrameSamplingConfig, process_due_edge_observations, run_retention
 
 
 def tearDownModule():
@@ -126,6 +133,33 @@ class PlateRulesTests(unittest.TestCase):
 
 
 class ImageTests(unittest.TestCase):
+    def test_privacy_face_and_person_blur_preserves_plate_region(self):
+        image = synthetic_vehicle_image()
+        cv2.circle(image, (42, 40), 16, (220, 190, 170), -1)
+        source = write_temp_image("privacy_source.jpg", image)
+        target = str(pathlib.Path(TEMP.name) / "privacy_safe.jpg")
+        plate_box = {"x": 112, "y": 158, "width": 146, "height": 40}
+        with patch("app.privacy.detect_faces", return_value=[{"x": 24, "y": 22, "width": 36, "height": 36}]), \
+             patch("app.privacy.detect_persons", return_value=[{"x": 18, "y": 60, "width": 68, "height": 130}]):
+            result = create_privacy_safe_derivative(source, target, [plate_box])
+        self.assertEqual(result.status, "processed")
+        masked = cv2.imread(target)
+        self.assertIsNotNone(masked)
+        self.assertGreater(np.mean(np.abs(masked[60:180, 18:86].astype(int) - image[60:180, 18:86].astype(int))), 1)
+        self.assertLess(np.mean(np.abs(masked[158:198, 112:258].astype(int) - image[158:198, 112:258].astype(int))), 2)
+
+    def test_privacy_no_person_image_and_detector_failure_are_safe(self):
+        image = synthetic_vehicle_image()
+        source = write_temp_image("privacy_empty.jpg", image)
+        target = str(pathlib.Path(TEMP.name) / "privacy_empty_safe.jpg")
+        with patch("app.privacy.detect_faces", return_value=[]), patch("app.privacy.detect_persons", return_value=[]):
+            result = create_privacy_safe_derivative(source, target, [])
+        self.assertEqual(result.status, "processed")
+        self.assertTrue(pathlib.Path(target).exists())
+        with patch("app.privacy.detect_faces", side_effect=RuntimeError("detector unavailable")):
+            failed = create_privacy_safe_derivative(source, str(pathlib.Path(TEMP.name) / "privacy_failed.jpg"), [])
+        self.assertEqual(failed.status, "failed")
+
     def test_padding_and_edge_detection(self):
         image = np.zeros((200, 500, 3), np.uint8)
         crop, edges = padded_plate_crop(image, (100, 60, 200, 40))
@@ -312,9 +346,63 @@ class ImageTests(unittest.TestCase):
         self.assertEqual(best["text"],"GJ01AB1234")
 
 
+class Phase11CryptoTests(unittest.TestCase):
+    def test_aes_256_gcm_encrypts_decrypts_and_uses_unique_nonces(self):
+        key = generate_key()
+        with patch.dict(os.environ, {"ANPR_ENCRYPTION_KEY": key, "ANPR_ENCRYPTION_KEY_VERSION": "v1"}, clear=False):
+            first = encrypt_sensitive("sensitive-path.jpg", resource_type="plate_event", purpose="original_image_path")
+            second = encrypt_sensitive("sensitive-path.jpg", resource_type="plate_event", purpose="original_image_path")
+            self.assertEqual(first.key_version, "v1")
+            self.assertNotEqual(first.nonce, second.nonce)
+            self.assertNotIn("sensitive-path", first.ciphertext)
+            self.assertEqual(
+                decrypt_sensitive(first.ciphertext, first.nonce, first.key_version,
+                                  resource_type="plate_event", purpose="original_image_path"),
+                "sensitive-path.jpg",
+            )
+
+    def test_aes_256_gcm_rejects_tampering_wrong_key_and_missing_key(self):
+        key = generate_key()
+        wrong_key = generate_key()
+        with patch.dict(os.environ, {"ANPR_ENCRYPTION_KEY": key, "ANPR_ENCRYPTION_KEY_VERSION": "v1"}, clear=False):
+            encrypted = encrypt_sensitive("secret", resource_type="plate_event", purpose="privacy_metadata")
+            tampered = encrypted.ciphertext[:-2] + "AA"
+            with self.assertRaises(Exception):
+                decrypt_sensitive(tampered, encrypted.nonce, encrypted.key_version,
+                                  resource_type="plate_event", purpose="privacy_metadata")
+        with patch.dict(os.environ, {"ANPR_ENCRYPTION_KEY": wrong_key, "ANPR_ENCRYPTION_KEY_VERSION": "v1"}, clear=False):
+            with self.assertRaises(Exception):
+                decrypt_sensitive(encrypted.ciphertext, encrypted.nonce, encrypted.key_version,
+                                  resource_type="plate_event", purpose="privacy_metadata")
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(Exception):
+                encrypt_sensitive("secret", resource_type="plate_event", purpose="privacy_metadata")
+
+    def test_key_version_selection_supports_rotation_without_reencrypting_old_data(self):
+        v1 = generate_key()
+        v2 = generate_key()
+        with patch.dict(os.environ, {"ANPR_ENCRYPTION_KEY": v1, "ANPR_ENCRYPTION_KEY_VERSION": "v1"}, clear=False):
+            old = encrypt_sensitive("old", resource_type="plate_event", purpose="original_image_path")
+        with patch.dict(os.environ, {"ANPR_ENCRYPTION_KEY": v2, "ANPR_ENCRYPTION_KEY_VERSION": "v2", "ANPR_ENCRYPTION_KEY_V1": v1}, clear=False):
+            new = encrypt_sensitive("new", resource_type="plate_event", purpose="original_image_path")
+            self.assertEqual(new.key_version, "v2")
+            self.assertEqual(decrypt_sensitive(old.ciphertext, old.nonce, old.key_version,
+                                               resource_type="plate_event", purpose="original_image_path"), "old")
+            self.assertEqual(decrypt_sensitive(new.ciphertext, new.nonce, new.key_version,
+                                               resource_type="plate_event", purpose="original_image_path"), "new")
+
+
 class APITests(unittest.TestCase):
     def setUp(self):
         with SessionLocal() as db:
+            db.query(AuditLog).delete()
+            db.query(SignalSimulationState).delete()
+            db.query(SignalRecommendation).delete()
+            db.query(SignalPhase).delete()
+            db.query(TrafficJunction).delete()
+            db.query(RetentionRun).delete()
+            db.query(EdgeObservation).delete()
+            db.query(EdgeDevice).delete()
             db.query(CameraRoadConnection).delete()
             db.query(EnforcementIncident).delete()
             db.query(PCRVehicle).delete()
@@ -330,9 +418,507 @@ class APITests(unittest.TestCase):
             db.commit()
         self.client_context = TestClient(app)
         self.client = self.client_context.__enter__()
+        self.login_as("admin_demo", "AdminDemo!2026")
 
     def tearDown(self):
         self.client_context.__exit__(None, None, None)
+
+    def login_as(self, username, password):
+        response = self.client.post("/api/auth/login", json={"username": username, "password": password})
+        self.assertEqual(response.status_code, 200, response.text)
+        token = response.json()["access_token"]
+        self.client.headers.update({"Authorization": f"Bearer {token}"})
+        return token
+
+    def unauthenticated_client(self):
+        context = TestClient(app)
+        return context, context.__enter__()
+
+    def test_phase8_auth_rejects_unauthenticated_invalid_and_inactive_users(self):
+        context, anonymous = self.unauthenticated_client()
+        try:
+            self.assertEqual(anonymous.get("/api/vehicles").status_code, 401)
+            self.assertEqual(anonymous.get("/api/audit").status_code, 401)
+            self.assertEqual(anonymous.post("/api/auth/login", json={
+                "username": "admin_demo",
+                "password": "wrong-password",
+            }).status_code, 401)
+        finally:
+            context.__exit__(None, None, None)
+        with SessionLocal() as db:
+            db.add(User(username="inactive_demo", password_hash=hash_password("InactiveDemo!2026"),
+                        role="TRAFFIC_OPERATOR", active=False,
+                        created_at=dt.datetime.utcnow(), updated_at=dt.datetime.utcnow()))
+            db.commit()
+        self.assertEqual(self.client.post("/api/auth/login", json={
+            "username": "inactive_demo",
+            "password": "InactiveDemo!2026",
+        }).status_code, 401)
+
+    def test_phase11_cookie_session_authenticates_api_websocket_and_logout(self):
+        context, browser = self.unauthenticated_client()
+        try:
+            self.assertEqual(browser.get("/api/cameras").status_code, 401)
+            login = browser.post("/api/auth/login", json={
+                "username": "admin_demo",
+                "password": "AdminDemo!2026",
+            })
+            self.assertEqual(login.status_code, 200, login.text)
+            self.assertIn("anpr_session=", login.headers.get("set-cookie", ""))
+            self.assertEqual(browser.get("/api/cameras").status_code, 200)
+            with browser.websocket_connect("/ws/events") as socket:
+                self.assertEqual(socket.receive_json()["type"], "connected")
+            self.assertEqual(browser.post("/api/auth/logout").status_code, 200)
+            self.assertEqual(browser.get("/api/cameras").status_code, 401)
+        finally:
+            context.__exit__(None, None, None)
+
+    def test_phase11_passwords_are_hashed_and_not_returned_or_audited(self):
+        response = self.client.post("/api/auth/login", json={"username": "admin_demo", "password": "AdminDemo!2026"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertNotIn("AdminDemo!2026", response.text)
+        self.assertNotIn("TrafficDemo!2026", response.text)
+        with SessionLocal() as db:
+            user = db.query(User).filter(User.username == "admin_demo").one()
+            self.assertNotEqual(user.password_hash, "AdminDemo!2026")
+            self.assertTrue(user.password_hash.startswith("pbkdf2_sha256$"))
+            self.assertFalse(any("AdminDemo!2026" in (row.details or "") for row in db.query(AuditLog).all()))
+
+    def test_phase11_security_headers_cookie_flags_and_cors(self):
+        response = self.client.get("/api/system/status")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers.get("x-content-type-options"), "nosniff")
+        self.assertIn("frame-ancestors 'none'", response.headers.get("content-security-policy", ""))
+        self.assertNotIn("strict-transport-security", {k.lower(): v for k, v in response.headers.items()})
+        with patch.dict(os.environ, {"ANPR_COOKIE_SECURE": "true", "ANPR_COOKIE_SAMESITE": "strict"}, clear=False):
+            login = self.client.post("/api/auth/login", json={"username": "admin_demo", "password": "AdminDemo!2026"})
+        cookie = login.headers.get("set-cookie", "")
+        self.assertIn("HttpOnly", cookie)
+        self.assertIn("Secure", cookie)
+        self.assertIn("SameSite=strict", cookie)
+
+        allowed = self.client.options("/api/system/status", headers={
+            "Origin": "http://127.0.0.1:8000",
+            "Access-Control-Request-Method": "GET",
+        })
+        self.assertEqual(allowed.status_code, 200)
+        self.assertEqual(allowed.headers.get("access-control-allow-origin"), "http://127.0.0.1:8000")
+        self.assertNotEqual(allowed.headers.get("access-control-allow-origin"), "*")
+        denied = self.client.options("/api/system/status", headers={
+            "Origin": "https://evil.example",
+            "Access-Control-Request-Method": "GET",
+        })
+        self.assertNotEqual(denied.headers.get("access-control-allow-origin"), "*")
+
+    def test_phase8_roles_have_expected_api_boundaries(self):
+        self.assertEqual(self.client.get("/api/audit/verify").status_code, 200)
+        self.assertEqual(self.client.get("/api/users").status_code, 200)
+
+        self.login_as("traffic_demo", "TrafficDemo!2026")
+        self.assertEqual(self.client.get("/api/traffic/dashboard").status_code, 200)
+        self.assertEqual(self.client.get("/api/vehicles").status_code, 200)
+        self.assertEqual(self.client.get("/api/audit").status_code, 403)
+        self.assertEqual(self.client.get("/api/users").status_code, 403)
+        self.assertEqual(self.client.post("/api/pcr", json={
+            "pcr_id": "PCR-T-DENIED",
+            "latitude": 23.0,
+            "longitude": 72.0,
+        }).status_code, 403)
+
+        self.login_as("pcr_demo", "PcrDemo!2026")
+        self.assertEqual(self.client.get("/api/pcr").status_code, 200)
+        self.assertEqual(self.client.get("/api/incidents").status_code, 200)
+        self.assertEqual(self.client.get("/api/audit").status_code, 403)
+        self.assertEqual(self.client.get("/api/users").status_code, 403)
+        self.assertEqual(self.client.get("/api/traffic/dashboard").status_code, 403)
+
+    def test_phase8_privacy_safe_display_and_original_evidence_rbac(self):
+        item = candidate("GJ01AB1234", dict(x=112, y=158, width=146, height=40), 1)
+        with patch("app.main.process_image", return_value=(item["text"], .94, "ok", json.dumps([item]))), \
+             patch("app.privacy.detect_faces", return_value=[{"x": 20, "y": 18, "width": 40, "height": 40}]), \
+             patch("app.privacy.detect_persons", return_value=[]):
+            response = self.client.post("/api/scan", data={"camera_id": "CAM01"},
+                                        files={"file": ("privacy.jpg", encode_jpeg(synthetic_vehicle_image()), "image/jpeg")})
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertIn("_privacy", body["image_path"])
+        self.assertTrue(body["original_image_available"])
+        self.assertEqual(self.client.get(body["image_path"]).status_code, 200)
+        self.assertEqual(self.client.get(body["original_image_path"]).status_code, 200)
+
+        self.login_as("traffic_demo", "TrafficDemo!2026")
+        events = self.client.get("/api/events").json()
+        self.assertIn("_privacy", events[0]["image_path"])
+        self.assertEqual(self.client.get(events[0]["image_path"]).status_code, 200)
+        self.assertEqual(self.client.get(events[0]["original_image_path"]).status_code, 403)
+
+    def test_phase11_encrypted_evidence_reference_is_not_plaintext_in_database(self):
+        item = candidate("GJ01AB1234", dict(x=112, y=158, width=146, height=40), 1)
+        key = generate_key()
+        with patch.dict(os.environ, {"ANPR_ENCRYPTION_KEY": key, "ANPR_ENCRYPTION_KEY_VERSION": "v1"}, clear=False), \
+             patch("app.main.process_image", return_value=(item["text"], .94, "ok", json.dumps([item]))), \
+             patch("app.privacy.detect_faces", return_value=[]), patch("app.privacy.detect_persons", return_value=[]):
+            response = self.client.post("/api/scan", data={"camera_id": "CAM01"},
+                                        files={"file": ("encrypted.jpg", encode_jpeg(synthetic_vehicle_image()), "image/jpeg")})
+            original_response = self.client.get(response.json()["original_image_path"])
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertTrue(body["original_image_available"])
+        self.assertEqual(original_response.status_code, 200)
+        with SessionLocal() as db:
+            row = db.get(PlateEvent, body["event_id"])
+            self.assertIsNone(row.original_image_path)
+            self.assertIsNotNone(row.original_image_path_ciphertext)
+            self.assertIsNotNone(row.original_image_path_nonce)
+            self.assertEqual(row.original_image_path_key_version, "v1")
+            self.assertIsNone(row.privacy_metadata)
+            self.assertIsNotNone(row.privacy_metadata_ciphertext)
+
+    def test_phase11_upload_path_traversal_and_arbitrary_files_are_blocked(self):
+        self.assertEqual(self.client.get("/uploads/../backend/app/auth.py").status_code, 404)
+        self.assertEqual(self.client.get("/uploads/%2e%2e/backend/app/auth.py").status_code, 404)
+        self.assertEqual(self.client.get("/api/evidence/999999/image").status_code, 404)
+
+    def test_phase11_upload_size_limit_rejects_large_payloads(self):
+        with patch.dict(os.environ, {"ANPR_MAX_UPLOAD_SIZE": "32"}, clear=False):
+            response = self.client.post("/api/scan", data={"camera_id": "CAM01"},
+                                        files={"file": ("large.jpg", b"x" * 64, "image/jpeg")})
+        self.assertEqual(response.status_code, 413)
+
+    def test_phase8_audit_log_hash_chain_and_tamper_detection(self):
+        lookup = self.client.get("/api/vehicles")
+        self.assertEqual(lookup.status_code, 200)
+        with SessionLocal() as db:
+            actions = [row.action for row in db.query(AuditLog).order_by(AuditLog.id.asc()).all()]
+            self.assertIn("vehicle_lookup", actions)
+            self.assertTrue(verify_audit_chain(db)["valid"])
+            record = db.query(AuditLog).filter(AuditLog.action == "vehicle_lookup").first()
+            self.assertEqual(record.username, "admin_demo")
+            self.assertNotIn("AdminDemo!2026", json.dumps([row.details for row in db.query(AuditLog).all()]))
+            record.reason = "tampered"
+            db.commit()
+            self.assertFalse(verify_audit_chain(db)["valid"])
+
+    def test_phase8_audit_detects_deleted_reordered_and_fake_records(self):
+        with SessionLocal() as db:
+            db.query(AuditLog).delete()
+            db.commit()
+            append_audit_log(db, action="first", resource_type="test", success=True)
+            append_audit_log(db, action="second", resource_type="test", success=True)
+            append_audit_log(db, action="third", resource_type="test", success=True)
+            db.commit()
+            self.assertTrue(verify_audit_chain(db)["valid"])
+            middle = db.query(AuditLog).filter(AuditLog.action == "second").one()
+            db.delete(middle)
+            db.commit()
+            self.assertFalse(verify_audit_chain(db)["valid"])
+
+        with SessionLocal() as db:
+            db.query(AuditLog).delete()
+            db.commit()
+            append_audit_log(db, action="first", resource_type="test", success=True)
+            append_audit_log(db, action="second", resource_type="test", success=True)
+            db.commit()
+            rows = db.query(AuditLog).order_by(AuditLog.id.asc()).all()
+            rows[0].current_hash, rows[1].current_hash = rows[1].current_hash, rows[0].current_hash
+            db.commit()
+            self.assertFalse(verify_audit_chain(db)["valid"])
+
+        with SessionLocal() as db:
+            db.query(AuditLog).delete()
+            db.commit()
+            append_audit_log(db, action="first", resource_type="test", success=True)
+            fake = AuditLog(audit_id="fake-audit-record", timestamp=dt.datetime.utcnow(),
+                            action="fake", resource_type="test", success=True,
+                            previous_hash="bad", current_hash="bad")
+            db.add(fake)
+            db.commit()
+            self.assertFalse(verify_audit_chain(db)["valid"])
+
+    def edge_observation(self, observation_id="edge-obs-1", camera_id="CAM01", plate_text="GJ01AB1234", **extra):
+        payload = {
+            "observation_id": observation_id,
+            "camera_id": camera_id,
+            "edge_device_id": "EDGE-DEMO-01",
+            "frame_id": f"frame-{observation_id}",
+            "sequence_number": 30,
+            "capture_timestamp": dt.datetime.utcnow().isoformat(),
+            "plate_text": plate_text,
+            "ocr_confidence": .94 if plate_text else 0.0,
+            "processing_status": "OK" if plate_text else "NO_PLATE",
+            "vehicle_type": "car",
+            "vehicle_color": "white",
+            "bbox": {"x": 112, "y": 158, "width": 146, "height": 40},
+            "privacy_status": "metadata_only",
+            "metadata": {"test": True},
+        }
+        payload.update(extra)
+        return payload
+
+    def test_phase9_frame_sampling_configuration(self):
+        config = FrameSamplingConfig(source_fps=30, processing_fps=2, max_processing_fps=5)
+        self.assertEqual(config.sampling_interval, 15)
+        self.assertTrue(config.should_process(30))
+        self.assertFalse(config.should_process(31))
+
+    def test_phase9_edge_single_batch_ingestion_and_idempotency(self):
+        first = self.client.post("/api/edge/observations", json=self.edge_observation())
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(first.json()["status"], "PROCESSED")
+        self.assertIsNotNone(first.json()["plate_event_id"])
+        duplicate = self.client.post("/api/edge/observations", json=self.edge_observation())
+        self.assertEqual(duplicate.status_code, 200, duplicate.text)
+        self.assertTrue(duplicate.json()["duplicate"])
+        batch = self.client.post("/api/edge/observations/batch", json={
+            "observations": [
+                self.edge_observation("edge-obs-2", "CAM02", "GJ01AB5678"),
+                self.edge_observation("edge-obs-3", "CAM03", None),
+            ]
+        })
+        self.assertEqual(batch.status_code, 200, batch.text)
+        self.assertEqual(batch.json()["received"], 2)
+        with SessionLocal() as db:
+            self.assertEqual(db.query(EdgeObservation).count(), 3)
+            self.assertEqual(db.query(PlateEvent).filter(PlateEvent.plate_text == "GJ01AB1234").count(), 1)
+            self.assertEqual(db.query(PlateEvent).filter(PlateEvent.plate_text == "GJ01AB5678").count(), 1)
+
+    def test_phase9_edge_validation_retry_and_health_status(self):
+        bad = self.client.post("/api/edge/observations", json={"observation_id": "bad"})
+        self.assertEqual(bad.status_code, 422)
+        with patch("app.edge.persist_plate_event", side_effect=RuntimeError("database temporarily unavailable")):
+            failed = self.client.post("/api/edge/observations", json=self.edge_observation("edge-fail-1"))
+        self.assertEqual(failed.status_code, 200, failed.text)
+        self.assertEqual(failed.json()["status"], "QUEUED")
+        self.assertEqual(failed.json()["retry_count"], 1)
+        self.assertEqual(len(process_due_edge_observations(limit=10)), 0)
+        with SessionLocal() as db:
+            row = db.query(EdgeObservation).filter(EdgeObservation.observation_id == "edge-fail-1").one()
+            row.next_retry_at = dt.datetime.utcnow() - dt.timedelta(seconds=1)
+            db.commit()
+        self.assertEqual(len(process_due_edge_observations(limit=10)), 1)
+        status = self.client.get("/api/edge/status").json()
+        self.assertGreaterEqual(status["observations_received"], 1)
+        self.assertIn(status["queue"]["mode"], {"local", "redis"})
+
+    def test_phase9_scalability_simulation_10_100_500_cameras(self):
+        for count in (10, 100, 500):
+            response = self.client.post("/api/edge/simulation/start", json={
+                "camera_count": count,
+                "observation_rate": 1,
+                "duration_seconds": .05,
+                "duplicate_rate": .02,
+                "failure_rate": .01,
+                "source_fps": 30,
+                "processing_fps": 5,
+            })
+            self.assertEqual(response.status_code, 200, response.text)
+            body = response.json()
+            self.assertEqual(body["label"], "SIMULATION / DEMO")
+            self.assertEqual(body["metrics"]["camera_count"], count)
+        status = self.client.get("/api/edge/status").json()
+        self.assertGreaterEqual(status["registered_cameras"], 500)
+        self.assertFalse(status["simulation"]["active"])
+
+    def test_phase9_retention_dry_run_delete_and_missing_file(self):
+        raw_dir = pathlib.Path(TEMP.name) / "edge-retention"
+        raw_dir.mkdir(exist_ok=True)
+        old_file = raw_dir / "old.jpg"
+        old_file.write_bytes(b"old-image")
+        missing_file = raw_dir / "missing.jpg"
+        old_time = dt.datetime.utcnow() - dt.timedelta(days=31)
+        with SessionLocal() as db:
+            db.add(PlateEvent(camera_id="CAM01", plate_text="GJ01AB1234", confidence=.95, status="ok",
+                              timestamp=old_time, original_image_path=str(old_file),
+                              privacy_image_path="/uploads/privacy-old.jpg"))
+            db.add(PlateEvent(camera_id="CAM02", plate_text="GJ01AB5678", confidence=.95, status="ok",
+                              timestamp=old_time, original_image_path=str(missing_file)))
+            db.commit()
+        dry = self.client.post("/api/retention/run", json={"dry_run": True, "raw_image_days": 30}).json()
+        self.assertEqual(dry["eligible_raw_images"], 2)
+        self.assertTrue(old_file.exists())
+        actual = self.client.post("/api/retention/run", json={"dry_run": False, "raw_image_days": 30}).json()
+        self.assertEqual(actual["deleted_raw_images"], 1)
+        self.assertEqual(actual["missing_raw_images"], 1)
+        self.assertFalse(old_file.exists())
+        archive_file = raw_dir / "archive-old.jpg"
+        archive_file.write_bytes(b"archive-image")
+        with SessionLocal() as db:
+            db.add(PlateEvent(camera_id="CAM03", plate_text="GJ01AB9999", confidence=.95, status="ok",
+                              timestamp=old_time, original_image_path=str(archive_file)))
+            db.commit()
+        archive_dir = raw_dir / "archive"
+        with patch.dict(os.environ, {"ANPR_RETENTION_ARCHIVE_DIR": str(archive_dir)}):
+            archived = run_retention(dry_run=False, raw_image_days=30, action="archive", actor="admin_demo")
+        self.assertEqual(archived["archived_raw_images"], 1)
+        self.assertFalse(archive_file.exists())
+        self.assertEqual(len(list(archive_dir.iterdir())), 1)
+        with SessionLocal() as db:
+            self.assertEqual(db.query(PlateEvent).count(), 3)
+            self.assertEqual(db.query(RetentionRun).count(), 3)
+            self.assertTrue(verify_audit_chain(db)["valid"])
+
+    def test_phase9_rbac_and_audit_for_edge_admin_actions(self):
+        context, unauth = self.unauthenticated_client()
+        try:
+            self.assertEqual(unauth.get("/api/edge/status").status_code, 401)
+            self.assertEqual(unauth.post("/api/edge/simulation/start", json={"camera_count": 10}).status_code, 401)
+        finally:
+            context.__exit__(None, None, None)
+        self.assertEqual(self.client.get("/api/edge/status").status_code, 200)
+        self.assertEqual(self.client.post("/api/edge/simulation/start", json={"camera_count": 10}).status_code, 200)
+        self.login_as("traffic_demo", "TrafficDemo!2026")
+        self.assertEqual(self.client.get("/api/edge/status").status_code, 200)
+        self.assertEqual(self.client.post("/api/edge/simulation/start", json={"camera_count": 10}).status_code, 403)
+        self.assertEqual(self.client.post("/api/retention/run", json={"dry_run": True}).status_code, 403)
+        self.login_as("pcr_demo", "PcrDemo!2026")
+        self.assertEqual(self.client.get("/api/edge/status").status_code, 403)
+        self.login_as("admin_demo", "AdminDemo!2026")
+        with SessionLocal() as db:
+            actions = [row.action for row in db.query(AuditLog).all()]
+            self.assertIn("edge_simulation_change", actions)
+            self.assertIn("retention_execution", actions)
+            self.assertTrue(verify_audit_chain(db)["valid"])
+
+    def signal_junction_payload(self, junction_id="JUNC-TEST-01", active=True):
+        return {
+            "junction_id": junction_id,
+            "name": "Test Smart Signal Junction",
+            "camera_ids": ["CAM01", "CAM02", "CAM03", "CAM04"],
+            "active": active,
+            "controller_mode": "simulation",
+        }
+
+    def create_signal_junction_with_phases(self, junction_id="JUNC-TEST-01", min_green=5, max_green=30):
+        response = self.client.post("/api/signals/junctions", json=self.signal_junction_payload(junction_id))
+        self.assertIn(response.status_code, {200, 201}, response.text)
+        for index, phase in enumerate((
+            ("NORTH_SOUTH_GREEN", "NORTH_SOUTH", ["CAM01", "CAM02"]),
+            ("EAST_WEST_GREEN", "EAST_WEST", ["CAM03", "CAM04"]),
+        )):
+            phase_response = self.client.post(f"/api/signals/junctions/{junction_id}/phases", json={
+                "phase_id": phase[0],
+                "movement": phase[1],
+                "movement_camera_ids": phase[2],
+                "min_green_seconds": min_green,
+                "max_green_seconds": max_green,
+                "yellow_seconds": 3,
+                "all_red_seconds": 1,
+                "display_order": index,
+            })
+            self.assertEqual(phase_response.status_code, 201, phase_response.text)
+        return response.json()
+
+    def seed_signal_demand(self):
+        for index in range(8):
+            persist_plate_event(dict(camera_id="CAM03", plate_text=f"GJ01AB{1200 + index}", confidence=.95, status="ok"), window_seconds=0)
+            persist_plate_event(dict(camera_id="CAM04", plate_text=f"GJ01AB{2200 + index}", confidence=.95, status="ok"), window_seconds=0)
+        for index in range(2):
+            persist_plate_event(dict(camera_id="CAM01", plate_text=f"GJ01CD{3200 + index}", confidence=.95, status="ok"), window_seconds=0)
+
+    def test_phase10_junction_configuration_and_validation(self):
+        body = self.create_signal_junction_with_phases()
+        self.assertEqual(body["junction_id"], "JUNC-TEST-01")
+        fetched = self.client.get("/api/signals/junctions/JUNC-TEST-01")
+        self.assertEqual(fetched.status_code, 200, fetched.text)
+        self.assertEqual(len(fetched.json()["phases"]), 2)
+        invalid = self.client.post("/api/signals/junctions/JUNC-TEST-01/phases", json={
+            "phase_id": "BAD_PHASE",
+            "movement": "BAD",
+            "movement_camera_ids": ["CAM01"],
+            "min_green_seconds": 40,
+            "max_green_seconds": 10,
+            "yellow_seconds": 0,
+            "all_red_seconds": 0,
+        })
+        self.assertEqual(invalid.status_code, 422)
+        inactive = self.client.patch("/api/signals/junctions/JUNC-TEST-01", json={"active": False})
+        self.assertEqual(inactive.status_code, 200, inactive.text)
+        recommendation = self.client.post("/api/signals/recommendation", json={"junction_id": "JUNC-TEST-01"})
+        self.assertEqual(recommendation.status_code, 422)
+
+    def test_phase10_demand_recommendation_fairness_and_safety(self):
+        self.create_signal_junction_with_phases(min_green=6, max_green=35)
+        self.seed_signal_demand()
+        with SessionLocal() as db:
+            phase = db.query(SignalPhase).filter(SignalPhase.phase_id == "NORTH_SOUTH_GREEN").one()
+            phase.last_served_at = dt.datetime.utcnow() - dt.timedelta(seconds=240)
+            db.commit()
+        demand = self.client.get("/api/signals/junctions/JUNC-TEST-01/demand").json()
+        self.assertIn(demand["data_quality"], {"LOW", "GOOD"})
+        movement_demand = {item["movement"]: item for item in demand["movements"]}
+        self.assertGreater(movement_demand["EAST_WEST"]["demand_score"], movement_demand["NORTH_SOUTH"]["demand_score"])
+        response = self.client.post("/api/signals/recommendation", json={"junction_id": "JUNC-TEST-01", "cycle_seconds": 70})
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["mode"], "RECOMMENDATION_ONLY")
+        self.assertFalse(body["safety"]["physical_control"])
+        self.assertTrue(body["safety"]["yellow_preserved"])
+        self.assertTrue(body["safety"]["all_red_preserved"])
+        phases = {item["movement"]: item for item in body["phases"]}
+        for item in phases.values():
+            self.assertGreaterEqual(item["recommended_green_seconds"], item["min_green_seconds"])
+            self.assertLessEqual(item["recommended_green_seconds"], item["max_green_seconds"])
+            self.assertGreaterEqual(item["yellow_seconds"], 3)
+            self.assertGreaterEqual(item["all_red_seconds"], 1)
+        self.assertGreaterEqual(phases["EAST_WEST"]["recommended_green_seconds"], phases["NORTH_SOUTH"]["recommended_green_seconds"])
+        body_demand = {item["movement"]: item for item in body["demand"]["movements"]}
+        self.assertIn("waiting_time", body_demand["NORTH_SOUTH"]["reasons"])
+        self.assertTrue(body["explanation"]["summary"])
+
+    def test_phase10_insufficient_data_returns_safe_default(self):
+        self.create_signal_junction_with_phases()
+        response = self.client.post("/api/signals/recommendation", json={"junction_id": "JUNC-TEST-01", "cycle_seconds": 60})
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["data_quality"], "INSUFFICIENT_DATA")
+        self.assertLessEqual(body["recommendation_reliability"], .3)
+        greens = [phase["recommended_green_seconds"] for phase in body["phases"]]
+        self.assertLessEqual(max(greens) - min(greens), 1)
+        self.assertIn("insufficient_data", body["explanation"]["reason_codes"])
+
+    def test_phase10_signal_simulator_and_controller_adapter(self):
+        self.create_signal_junction_with_phases(min_green=5, max_green=20)
+        recommendation = self.client.post("/api/signals/recommendation", json={"junction_id": "JUNC-TEST-01", "cycle_seconds": 30}).json()
+        start = self.client.post("/api/signals/simulation/JUNC-TEST-01/start", json={
+            "recommendation_id": recommendation["recommendation_id"],
+        })
+        self.assertEqual(start.status_code, 200, start.text)
+        self.assertTrue(start.json()["active"])
+        self.assertEqual(start.json()["phase_kind"], "GREEN")
+        tick_green = self.client.post("/api/signals/simulation/JUNC-TEST-01/tick", json={"seconds": start.json()["remaining_seconds"]})
+        self.assertEqual(tick_green.status_code, 200, tick_green.text)
+        self.assertEqual(tick_green.json()["phase_kind"], "YELLOW")
+        tick_yellow = self.client.post("/api/signals/simulation/JUNC-TEST-01/tick", json={"seconds": 3})
+        self.assertEqual(tick_yellow.json()["phase_kind"], "ALL_RED")
+        reset = self.client.post("/api/signals/simulation/JUNC-TEST-01/reset")
+        self.assertFalse(reset.json()["active"])
+        apply = self.client.post("/api/signals/controller/apply", json={"recommendation_id": recommendation["recommendation_id"]})
+        self.assertEqual(apply.status_code, 200, apply.text)
+        self.assertIn("SIMULATION MODE", apply.json()["mode"])
+        self.assertFalse(apply.json()["physical_control"])
+
+    def test_phase10_signal_rbac_and_audit(self):
+        context, anonymous = self.unauthenticated_client()
+        try:
+            self.assertEqual(anonymous.get("/api/signals/junctions").status_code, 401)
+        finally:
+            context.__exit__(None, None, None)
+        self.create_signal_junction_with_phases("JUNC-RBAC-01")
+        self.assertEqual(self.client.get("/api/signals/junctions").status_code, 200)
+        self.login_as("traffic_demo", "TrafficDemo!2026")
+        self.assertEqual(self.client.get("/api/signals/junctions").status_code, 200)
+        self.assertEqual(self.client.post("/api/signals/recommendation", json={"junction_id": "JUNC-RBAC-01"}).status_code, 200)
+        self.assertEqual(self.client.post("/api/signals/junctions", json=self.signal_junction_payload("JUNC-DENIED-01")).status_code, 403)
+        self.login_as("pcr_demo", "PcrDemo!2026")
+        self.assertEqual(self.client.get("/api/signals/junctions").status_code, 403)
+        self.login_as("admin_demo", "AdminDemo!2026")
+        self.client.post("/api/signals/simulation/JUNC-RBAC-01/start", json={})
+        with SessionLocal() as db:
+            actions = [row.action for row in db.query(AuditLog).all()]
+            self.assertIn("signal_configuration_change", actions)
+            self.assertIn("signal_recommendation_generate", actions)
+            self.assertIn("signal_simulation_change", actions)
+            self.assertTrue(verify_audit_chain(db)["valid"])
 
     def test_camera_validation_unknown_and_zero(self):
         for coordinates in (dict(lat=91,lng=2), dict(lat=2), dict(lat="NaN",lng=2)):
@@ -1300,7 +1886,8 @@ class APITests(unittest.TestCase):
             heatmap = self.client.get("/api/traffic/heatmap").json()["points"]
             self.assertTrue(any(item["camera_id"] == "CAM01" and item["traffic_count"] == 1 for item in heatmap))
             lanes = self.client.get("/api/traffic/lanes").json()
-            self.assertEqual(lanes["status"], "not_configured")
+            self.assertEqual(lanes["status"], "NO_DATA")
+            self.assertFalse(lanes["available"])
             with SessionLocal() as db:
                 self.assertEqual(db.get(PlateEvent, first.id).vehicle_id, db.get(PlateEvent, second.id).vehicle_id)
 
@@ -1502,17 +2089,15 @@ class APITests(unittest.TestCase):
             self.assertEqual(match.review_status, "pending")
             self.assertNotEqual(db.get(PlateEvent, first.id).vehicle_id, db.get(PlateEvent, second.id).vehicle_id)
 
-    def test_matching_unreadable_plate_similar_appearance_candidate(self):
+    def test_matching_unreadable_plate_similar_appearance_is_suppressed(self):
         first = persist_plate_event(dict(camera_id="CAM01", plate_text="GJ01AB1234",
                                          confidence=.95, status="ok", **appearance_values()))[0]
         unreadable = persist_plate_event(dict(camera_id="CAM03", plate_text=None,
                                              confidence=0, status="PENDING_REVIEW", **appearance_values()))[0]
         self.assertIsNone(unreadable.vehicle_id)
         with SessionLocal() as db:
-            match = db.query(VehicleMatchCandidate).one()
-            self.assertEqual(match.state, "MEDIUM_CONFIDENCE")
-            self.assertEqual(match.candidate_vehicle_id, first.vehicle_id)
-            self.assertFalse(json.loads(match.plate_evidence)["used"])
+            self.assertEqual(db.query(VehicleMatchCandidate).count(), 0)
+            self.assertIsNotNone(db.get(PlateEvent, first.id).vehicle_id)
 
     def test_matching_unreadable_different_appearance_low_confidence(self):
         persist_plate_event(dict(camera_id="CAM01", plate_text="GJ01AB1234",
@@ -1542,6 +2127,7 @@ class APITests(unittest.TestCase):
         comparison = compare_observations(left, right)
         self.assertFalse(comparison["plate_evidence"]["used"])
         self.assertNotIn("plate_similarity", comparison["factors_used"])
+        self.assertEqual(comparison["state"], "LOW_CONFIDENCE")
 
     def test_matching_missing_embedding_uses_valid_plate_safely(self):
         first = persist_plate_event(dict(camera_id="CAM01", plate_text="GJ01AB1234",
@@ -1567,18 +2153,18 @@ class APITests(unittest.TestCase):
     def test_matching_review_accept_and_reject(self):
         first = persist_plate_event(dict(camera_id="CAM01", plate_text="GJ01AB1234",
                                          confidence=.95, status="ok", **appearance_values()))[0]
-        second = persist_plate_event(dict(camera_id="CAM02", plate_text=None, confidence=0,
-                                          status="PENDING_REVIEW", **appearance_values()))[0]
+        second = persist_plate_event(dict(camera_id="CAM02", plate_text="GJ01AB5678", confidence=.95,
+                                          status="ok", **appearance_values()))[0]
         pending = self.client.get("/api/matches/review").json()["items"]
         self.assertEqual(len(pending), 1)
         accepted = self.client.post(f"/api/matches/{pending[0]['match_id']}/review",
-                                    json={"action":"accept"}).json()
-        self.assertEqual(accepted["review_status"], "accepted")
+                                    json={"action":"accept"})
+        self.assertEqual(accepted.status_code, 409)
         with SessionLocal() as db:
-            self.assertEqual(db.get(PlateEvent, second.id).vehicle_id, first.vehicle_id)
+            self.assertNotEqual(db.get(PlateEvent, second.id).vehicle_id, first.vehicle_id)
 
-        third = persist_plate_event(dict(camera_id="CAM03", plate_text=None, confidence=0,
-                                         status="PENDING_REVIEW", **appearance_values()))[0]
+        third = persist_plate_event(dict(camera_id="CAM03", plate_text="GJ01AB9999", confidence=.95,
+                                         status="ok", **appearance_values()))[0]
         reject_match = next(item for item in self.client.get("/api/matches/review").json()["items"]
                             if item["observation_b_id"] == third.id)
         rejected = self.client.post(f"/api/matches/{reject_match['match_id']}/review",
@@ -1629,18 +2215,34 @@ class APITests(unittest.TestCase):
             self.assertEqual(len(largest.json()["detections"]), 1)
             self.assertEqual(largest.json()["plate_text"],"GJ01AB5678")
 
-    def test_auto_frame_rejects_incomplete_ocr(self):
+    def test_auto_frame_persists_reviewable_partial_ocr(self):
         junk = dict(text="D",raw_text="D",confidence=.79,status="PENDING_REVIEW",
-                    valid_format=False,bbox=dict(x=20,y=40,width=120,height=40),detection_id=1)
+                    needs_review=True, reviewable=True, valid_format=False,
+                    bbox=dict(x=20,y=40,width=120,height=40),detection_id=1)
         with patch("app.main.process_image", return_value=("D",.79,"PENDING_REVIEW",json.dumps([junk]))):
             response = self.client.post("/api/process-frame",data={"camera_id":"CAM03"},files={"frame":("image.jpg",b"test","image/jpeg")})
         self.assertEqual(response.status_code,200,response.text)
         body = response.json()
-        self.assertIsNone(body["event_id"])
+        self.assertIsNotNone(body["event_id"])
         self.assertEqual(body["camera_id"],"CAM03")
+        self.assertEqual(body["plate_text"], "D")
+        self.assertEqual(body["raw_text"], "D")
+        self.assertEqual(body["confidence"], .79)
+        self.assertEqual(body["status"], "PENDING_REVIEW")
+        self.assertTrue(body["needs_review"])
+        with SessionLocal() as db:
+            self.assertEqual(db.query(PlateEvent).count(),1)
+
+    def test_auto_frame_ignores_zero_confidence_unreadable(self):
+        unreadable = dict(text=None, raw_text="", confidence=0.0, status="PENDING_REVIEW",
+                          needs_review=True, reviewable=False, valid_format=False,
+                          violations=["unreadable_crop"], detection_id=1)
+        with patch("app.main.process_image", return_value=(None,0.0,"PENDING_REVIEW",json.dumps([unreadable]))):
+            response = self.client.post("/api/process-frame",data={"camera_id":"CAM03"},files={"frame":("image.jpg",b"test","image/jpeg")})
+        self.assertEqual(response.status_code,200,response.text)
+        body = response.json()
+        self.assertIsNone(body["event_id"])
         self.assertIsNone(body["plate_text"])
-        self.assertIsNone(body["raw_text"])
-        self.assertEqual(body["confidence"],0.0)
         self.assertEqual(body["status"],"scanning")
         self.assertFalse(body["needs_review"])
         self.assertEqual(body["detections"],[])
@@ -1700,6 +2302,59 @@ class APITests(unittest.TestCase):
             self.assertEqual(socket.receive_json()["type"],"connected")
             socket.send_json({"action":"ping"})
             self.assertEqual(socket.receive_json()["type"],"pong")
+
+    def test_phase11_websocket_rejects_unauthenticated_client(self):
+        context, anonymous = self.unauthenticated_client()
+        try:
+            with self.assertRaises(Exception):
+                with anonymous.websocket_connect("/ws/events"):
+                    pass
+        finally:
+            context.__exit__(None, None, None)
+
+    def test_phase11_edge_auth_required_blocks_anonymous_and_accepts_edge_token(self):
+        payload = {
+            "observation_id": "edge-sec-1",
+            "camera_id": "CAM01",
+            "edge_device_id": "EDGE-SEC-01",
+            "capture_timestamp": dt.datetime.utcnow().isoformat(),
+            "plate_text": "GJ01AB1234",
+            "ocr_confidence": 0.95,
+        }
+        with patch.dict(os.environ, {"ANPR_EDGE_AUTH_REQUIRED": "true", "ANPR_EDGE_TOKEN": "edge-secret"}, clear=False):
+            denied = self.client.post("/api/edge/observations", json=payload)
+            self.assertEqual(denied.status_code, 401)
+            accepted = self.client.post("/api/edge/observations", json=payload,
+                                        headers={"Authorization": "Bearer edge-secret"})
+        self.assertEqual(accepted.status_code, 200, accepted.text)
+        with SessionLocal() as db:
+            device = db.query(EdgeDevice).filter(EdgeDevice.edge_device_id == "EDGE-SEC-01").one()
+            self.assertIsNotNone(device.credential_hash)
+            self.assertNotEqual(device.credential_hash, "edge-secret")
+
+    def test_phase11_edge_batch_limit_and_malformed_input(self):
+        payload = {"observations": [
+            {
+                "observation_id": f"edge-batch-{index}",
+                "camera_id": "CAM01",
+                "edge_device_id": "EDGE-BATCH",
+                "capture_timestamp": dt.datetime.utcnow().isoformat(),
+            }
+            for index in range(3)
+        ]}
+        with patch.dict(os.environ, {"ANPR_MAX_EDGE_BATCH_SIZE": "2"}, clear=False):
+            self.assertEqual(self.client.post("/api/edge/observations/batch", json=payload).status_code, 422)
+        self.assertEqual(self.client.post("/api/edge/observations", json={"camera_id": "CAM01"}).status_code, 422)
+
+    def test_phase11_security_events_preserve_audit_chain(self):
+        context, anonymous = self.unauthenticated_client()
+        try:
+            self.assertEqual(anonymous.get("/api/vehicles").status_code, 401)
+        finally:
+            context.__exit__(None, None, None)
+        with SessionLocal() as db:
+            self.assertGreaterEqual(db.query(AuditLog).count(), 1)
+            self.assertTrue(verify_audit_chain(db)["valid"])
 
     def add_pcr(self, pcr_id="PCR01", lat=23.0325, lng=72.5245, status="AVAILABLE", **extra):
         body = dict(pcr_id=pcr_id, name=pcr_id, vehicle_identifier=f"DEMO-{pcr_id}",

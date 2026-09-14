@@ -1,11 +1,19 @@
 /* Shared reconnect lifecycle for scanner and dashboard sockets. */
 class ANPRSocket extends EventTarget {
-  constructor(url, { onMessage = () => {}, onState = () => {}, WebSocketClass = WebSocket } = {}) {
+  constructor(url, {
+    onMessage = () => {},
+    onState = () => {},
+    WebSocketClass = WebSocket,
+    maxAttempts = 6,
+    shouldReconnect = () => true,
+  } = {}) {
     super();
     this.url = url;
     this.onMessage = onMessage;
     this.onState = onState;
     this.WebSocketClass = WebSocketClass;
+    this.maxAttempts = maxAttempts;
+    this.shouldReconnect = shouldReconnect;
     this.attempt = 0;
     this.stopped = false;
     this.socket = null;
@@ -45,10 +53,17 @@ class ANPRSocket extends EventTarget {
       if (data.type !== "pong") this.onMessage(data);
     };
     socket.onerror = () => socket.close();
-    socket.onclose = () => {
+    socket.onclose = event => {
       clearTimeout(timeout);
       clearInterval(heartbeat);
       if (this.socket !== socket || this.stopped) return;
+      const closeCode = event?.code;
+      if (!this.shouldReconnect() || closeCode === 1008 || this.attempt >= this.maxAttempts) {
+        this.stopped = true;
+        this.onState(closeCode === 1008 ? "unauthorized" : "disconnected");
+        this.dispatchEvent(new Event("closed"));
+        return;
+      }
       this.onState("reconnecting");
       const delay = Math.min(15000, 1000 * 2 ** this.attempt++) * (.8 + Math.random() * .4);
       this.retry = setTimeout(() => this.connect(), delay);

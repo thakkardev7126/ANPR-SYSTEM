@@ -1,13 +1,13 @@
 /* Durable hotlist inbox shared by every operational page. */
 (() => {
-  const base = location.port === "5500" ? `${location.protocol}//${location.hostname}:8000` : location.origin;
+  const base = window.ANPRAuth?.base || (location.port === "5500" ? `${location.protocol}//${location.hostname}:8000` : location.origin);
   const host = document.createElement("aside");
   host.id = "hotlistPopups";
   host.setAttribute("aria-label", "Hotlist alerts");
   document.body.append(host);
   const pending = new Map();
   const revisions = new Map();
-  let socket, timer, syncing = false, stopped = false;
+  let socket, timer, syncing = false, stopped = true;
   const camera = () => document.body.dataset.hotlistScope === "camera"
     ? document.getElementById("cameraSelect")?.value : null;
   const text = (tag, value, parent) => {
@@ -17,7 +17,10 @@
     return node;
   };
   async function request(path, options = {}) {
-    const res = await fetch(base + path, {...options, signal:AbortSignal.timeout(6000)});
+    const res = window.ANPRAuth
+      ? await window.ANPRAuth.request(path, options, 6000)
+      : await fetch(base + path, {...options, credentials:"include", signal:AbortSignal.timeout(6000)});
+    if (res.status === 401) stop();
     if (!res.ok) throw new Error(`Hotlist request failed (${res.status})`);
     return res.json();
   }
@@ -91,17 +94,32 @@
     finally { syncing = false; }
   }
   function start() {
+    if (socket || !window.ANPRAuth?.isAuthenticated()) return;
     stopped = false;
-    socket = new ANPRSocket(base.replace(/^http/,"ws") + "/ws/events", {
+    socket = new ANPRSocket(base.replace(/^http/,"ws") + `/ws/events`, {
       onMessage: message => { if (message.type === "hotlist_alert") receive(message.alert); },
-      onState: state => { if (state === "connected") sync(); }
+      onState: state => {
+        if (state === "connected") sync();
+        if (state === "unauthorized" || state === "disconnected") socket = null;
+      },
+      shouldReconnect: () => window.ANPRAuth?.isAuthenticated() === true,
     });
     timer = setInterval(sync, 10000);
     sync();
   }
+  function stop() {
+    stopped = true;
+    clearInterval(timer);
+    timer = null;
+    socket?.close();
+    socket = null;
+    pending.clear();
+    render();
+  }
   window.HotlistAlerts = {receive, acknowledge, sync};
   document.getElementById("cameraSelect")?.addEventListener("change", () => { render(); sync(); });
-  window.addEventListener("pagehide", () => { stopped = true; clearInterval(timer); socket?.close(); });
+  window.addEventListener("pagehide", stop);
   window.addEventListener("pageshow", event => { if (event.persisted) start(); });
-  start();
+  window.addEventListener("anpr-auth-change", event => { event.detail.user ? start() : stop(); });
+  if (window.ANPRAuth?.isAuthenticated()) start();
 })();

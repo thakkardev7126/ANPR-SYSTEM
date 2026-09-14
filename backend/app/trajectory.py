@@ -34,6 +34,17 @@ def is_confirmed_plate_event(event):
     )
 
 
+def _confirmed_plate_text(event):
+    if not event:
+        return None
+    rule = normalize_plate_text(event.plate_text)
+    if not rule.valid_format or not rule.normalized_text:
+        return None
+    if event.status == PENDING_REVIEW_STATUS or (event.confidence or 0.0) < OCR_ACCEPT_CONFIDENCE:
+        return None
+    return rule.normalized_text
+
+
 def haversine_km(lat1, lng1, lat2, lng2):
     R = 6371.0
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
@@ -171,7 +182,9 @@ def vehicle_observation_payload(event, camera=None):
         "lat": lat,
         "lng": lng,
         "timestamp": _safe_iso(event.timestamp),
-        "image_path": event.image_path,
+        "image_path": event.privacy_image_path or f"/api/evidence/{event.id}/image?kind=privacy",
+        "privacy_image_path": event.privacy_image_path,
+        "original_image_available": bool(getattr(event, "original_image_path", None) or getattr(event, "original_image_path_ciphertext", None)),
         "bbox": _bbox_payload(event),
         "track_id": event.track_id,
         "plate_category": event.plate_category,
@@ -196,6 +209,8 @@ def _ordered_events(events):
 
 def _matching_evidence_for_pair(db, previous_event, event):
     if not previous_event or not event or previous_event.id is None or event.id is None:
+        return None
+    if not _confirmed_plate_text(previous_event) or not _confirmed_plate_text(event):
         return None
     match = (
         db.query(VehicleMatchCandidate)

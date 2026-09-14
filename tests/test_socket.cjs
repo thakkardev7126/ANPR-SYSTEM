@@ -6,7 +6,7 @@ class FakeWebSocket {
   static instances = [];
   constructor(url) { this.url=url; this.readyState=0; this.sent=[]; FakeWebSocket.instances.push(this); }
   open() { this.readyState=1; this.onopen?.(); }
-  close() { this.readyState=3; this.onclose?.(); }
+  close(code = 1000) { this.readyState=3; this.onclose?.({code}); }
   send(data) { this.sent.push(data); }
   receive(data) { this.onmessage?.({data:JSON.stringify(data)}); }
 }
@@ -60,6 +60,32 @@ test("connection timeout schedules retry", t => {
   t.mock.timers.tick(10000);
   t.mock.timers.tick(2000);
   assert.equal(FakeWebSocket.instances.length,2);
+  socket.close();
+});
+
+test("stops retrying after authentication rejection", t => {
+  t.mock.timers.enable({apis:["setTimeout","setInterval"]});
+  FakeWebSocket.instances=[];
+  const states=[];
+  const socket=new Socket("ws://test/ws/events",{WebSocketClass:FakeWebSocket,onState:s=>states.push(s)});
+  FakeWebSocket.instances[0].close(1008);
+  t.mock.timers.tick(60000);
+  assert.equal(FakeWebSocket.instances.length,1);
+  assert.equal(states.at(-1),"unauthorized");
+  assert.equal(socket.readyState,3);
+});
+
+test("retry loop is bounded", t => {
+  t.mock.timers.enable({apis:["setTimeout","setInterval"]});
+  FakeWebSocket.instances=[];
+  const socket=new Socket("ws://test/ws/events",{WebSocketClass:FakeWebSocket,maxAttempts:2});
+  FakeWebSocket.instances[0].close(1006);
+  t.mock.timers.tick(3000);
+  FakeWebSocket.instances[1].close(1006);
+  t.mock.timers.tick(6000);
+  FakeWebSocket.instances[2].close(1006);
+  t.mock.timers.tick(60000);
+  assert.equal(FakeWebSocket.instances.length,3);
   socket.close();
 });
 
