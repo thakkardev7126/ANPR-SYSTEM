@@ -26,6 +26,10 @@ def _csv_env(name: str, default: list[str] | None = None) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def _production_default(production_value: int, development_value: int) -> int:
+    return production_value if os.getenv("ANPR_ENV", "development").strip().lower() == "production" else development_value
+
+
 @dataclass(frozen=True)
 class SecuritySettings:
     env: str = field(default_factory=lambda: os.getenv("ANPR_ENV", "development").strip().lower())
@@ -43,6 +47,15 @@ class SecuritySettings:
     edge_auth_required: bool = field(default_factory=lambda: _bool_env("ANPR_EDGE_AUTH_REQUIRED", os.getenv("ANPR_ENV", "development").lower() == "production"))
     edge_timestamp_skew_seconds: int = field(default_factory=lambda: _int_env("ANPR_EDGE_TIMESTAMP_SKEW_SECONDS", 300))
     auth_query_tokens: bool = field(default_factory=lambda: _bool_env("ANPR_ALLOW_QUERY_TOKENS", False))
+    rate_limit_enabled: bool = field(default_factory=lambda: _bool_env("ANPR_RATE_LIMIT_ENABLED", True))
+    rate_limit_login_max: int = field(default_factory=lambda: _int_env("ANPR_RATE_LIMIT_LOGIN_MAX", _production_default(20, 300)))
+    rate_limit_login_window_seconds: int = field(default_factory=lambda: _int_env("ANPR_RATE_LIMIT_LOGIN_WINDOW_SECONDS", 60))
+    rate_limit_auth_max: int = field(default_factory=lambda: _int_env("ANPR_RATE_LIMIT_AUTH_MAX", _production_default(120, 600)))
+    rate_limit_auth_window_seconds: int = field(default_factory=lambda: _int_env("ANPR_RATE_LIMIT_AUTH_WINDOW_SECONDS", 60))
+    rate_limit_processing_max: int = field(default_factory=lambda: _int_env("ANPR_RATE_LIMIT_PROCESSING_MAX", _production_default(60, 600)))
+    rate_limit_processing_window_seconds: int = field(default_factory=lambda: _int_env("ANPR_RATE_LIMIT_PROCESSING_WINDOW_SECONDS", 60))
+    rate_limit_edge_max: int = field(default_factory=lambda: _int_env("ANPR_RATE_LIMIT_EDGE_MAX", _production_default(120, 1000)))
+    rate_limit_edge_window_seconds: int = field(default_factory=lambda: _int_env("ANPR_RATE_LIMIT_EDGE_WINDOW_SECONDS", 60))
 
     @property
     def production(self) -> bool:
@@ -63,3 +76,32 @@ class SecuritySettings:
 
 def get_security_settings() -> SecuritySettings:
     return SecuritySettings()
+
+
+def validate_production_security_config() -> list[str]:
+    settings = get_security_settings()
+    if not settings.production:
+        return []
+    issues: list[str] = []
+    auth_secret = os.getenv("ANPR_AUTH_SECRET", "")
+    if not auth_secret or auth_secret == "local-sih-demo-change-me":
+        issues.append("ANPR_AUTH_SECRET must be set to a non-default value")
+    if not settings.cookie_secure:
+        issues.append("ANPR_COOKIE_SECURE=true is required for production HTTPS")
+    if settings.cookie_samesite not in {"lax", "strict", "none"}:
+        issues.append("ANPR_COOKIE_SAMESITE must be lax, strict or none")
+    if settings.cookie_samesite == "none" and not settings.cookie_secure:
+        issues.append("SameSite=None requires Secure cookies")
+    if not settings.allowed_origins:
+        issues.append("ANPR_ALLOWED_ORIGINS must list explicit production origins")
+    if "*" in settings.allowed_origins:
+        issues.append("Wildcard CORS origins are not allowed in production")
+    if not settings.edge_auth_required:
+        issues.append("ANPR_EDGE_AUTH_REQUIRED=true is required in production")
+    return issues
+
+
+def require_production_security_config() -> None:
+    issues = validate_production_security_config()
+    if issues:
+        raise RuntimeError("Invalid production security configuration: " + "; ".join(issues))

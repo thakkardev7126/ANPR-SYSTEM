@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from app.database import Camera, PlateEvent
 from app.location import iso_utc
-from app.road_network import get_connection
+from app.road_network import effective_route_estimate, get_connection
 
 
 CALCULATED = "calculated"
@@ -49,6 +49,12 @@ def _base_segment(previous_event, event):
         "road_name": None,
         "road_type": None,
         "direction": None,
+        "configured_distance_meters": None,
+        "configured_distance_source": None,
+        "routing_source": None,
+        "routing_provider": None,
+        "route_geometry": None,
+        "route_duration_seconds": None,
     }
 
 
@@ -77,18 +83,27 @@ def calculate_travel_segment(db, previous_event: PlateEvent | None, event: Plate
         segment["speed_status_detail"] = "No active directed road connection is configured for this camera pair."
         return segment
 
+    estimate = effective_route_estimate(db, connection)
+    distance_meters = estimate.distance_meters if estimate else connection.distance_meters
+    distance_source = estimate.distance_source if estimate else connection.distance_source
     segment.update({
-        "distance_meters": connection.distance_meters,
-        "distance_km": round(connection.distance_meters / 1000.0, 3) if connection.distance_meters else None,
-        "distance_source": connection.distance_source,
-        "distance_is_approximate": connection.distance_source == "fallback_straight_line",
+        "distance_meters": distance_meters,
+        "distance_km": round(distance_meters / 1000.0, 3) if distance_meters else None,
+        "distance_source": distance_source,
+        "distance_is_approximate": distance_source == "fallback_straight_line",
         "connection_id": connection.id,
         "road_name": connection.road_name,
         "road_type": connection.road_type,
         "direction": connection.direction,
+        "configured_distance_meters": connection.distance_meters,
+        "configured_distance_source": connection.distance_source,
+        "routing_source": distance_source,
+        "routing_provider": estimate.provider if estimate else connection.provider,
+        "route_geometry": estimate.route_geometry if estimate else None,
+        "route_duration_seconds": estimate.duration_seconds if estimate else None,
     })
     try:
-        distance = float(connection.distance_meters)
+        distance = float(distance_meters)
     except (TypeError, ValueError):
         distance = 0.0
     if distance <= 0:
@@ -102,11 +117,15 @@ def calculate_travel_segment(db, previous_event: PlateEvent | None, event: Plate
         "estimated_speed_kmh": round(speed_mps * 3.6, 3),
         "speed_available": True,
         "speed_status": CALCULATED_APPROXIMATE
-        if connection.distance_source == "fallback_straight_line" else CALCULATED,
+        if distance_source == "fallback_straight_line" else CALCULATED,
         "speed_status_detail": (
             "Estimated camera-to-camera average speed from approximate straight-line fallback distance."
-            if connection.distance_source == "fallback_straight_line"
-            else "Estimated camera-to-camera average speed from configured road distance."
+            if distance_source == "fallback_straight_line"
+            else (
+                "Estimated camera-to-camera average speed from OSRM road routing distance."
+                if distance_source == "osrm"
+                else "Estimated camera-to-camera average speed from configured road distance."
+            )
         ),
     })
     return segment

@@ -1,5 +1,5 @@
 CREATE TABLE IF NOT EXISTS camera_road_connections (
-    id INTEGER PRIMARY KEY,
+    id SERIAL PRIMARY KEY,
     source_camera_id VARCHAR NOT NULL,
     destination_camera_id VARCHAR NOT NULL,
     distance_meters FLOAT NOT NULL,
@@ -9,9 +9,9 @@ CREATE TABLE IF NOT EXISTS camera_road_connections (
     road_type VARCHAR,
     provider VARCHAR NOT NULL DEFAULT 'manual',
     provider_reference VARCHAR,
-    active BOOLEAN NOT NULL DEFAULT 1,
-    created_at DATETIME NOT NULL,
-    updated_at DATETIME NOT NULL,
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL,
     CONSTRAINT uq_camera_road_pair UNIQUE (source_camera_id, destination_camera_id)
 );
 

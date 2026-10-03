@@ -5,6 +5,8 @@ import tempfile
 import pathlib
 import json
 import base64
+import hashlib
+import hmac
 import datetime as dt
 import asyncio
 import unittest
@@ -30,12 +32,15 @@ from app.image_quality import padded_plate_crop, normalize_size, assess_quality,
 from app.location import resolve_location
 from app.database import SessionLocal, PlateEvent, Camera, CameraRoadConnection, Vehicle, VehicleMatchCandidate, VehicleAnomaly, PlateSuspicionEvent, RouteAnomalyEvent, persist_plate_event, engine, HotlistEntry, HotlistAlert, HotlistNotification, PCRVehicle, EnforcementIncident, AuditLog, User, EdgeDevice, EdgeObservation, RetentionRun, TrafficJunction, SignalPhase, SignalRecommendation, SignalSimulationState
 from app.audit import append_audit_log, verify_audit_chain
-from app.auth import hash_password
+from app.auth import COOKIE_NAME, CSRF_HEADER_NAME, SECRET, _b64url, hash_password
 from app.crypto import decrypt_sensitive, encrypt_sensitive, generate_key
 from app.privacy import create_privacy_safe_derivative
 from app.main import app
 from app.seed_cameras import seed
-from app.road_network import camera_transition
+from app.map_config import map_tile_config
+from app.road_network import build_osrm_route_url, camera_transition, parse_osrm_route
+from app.security import reset_rate_limit_state
+from app.security_config import get_security_settings, validate_production_security_config
 from app.travel_time import calculate_travel_segment, vehicle_speed_history
 from app.trajectory import build_vehicle_trajectory
 from app.vehicle_appearance import (
@@ -48,6 +53,7 @@ from app.vehicle_appearance import (
 )
 from app.vehicle_matching import compare_observations, process_observation_matches
 from app.edge import FrameSamplingConfig, process_due_edge_observations, run_retention
+from scripts import release_sanity
 
 
 def tearDownModule():
@@ -93,6 +99,12 @@ def appearance_values(color=(95, 95, 95)):
         "appearance_embedding_version": version,
         "appearance_quality": 10.0,
     }
+
+
+def signed_test_token(payload):
+    body = _b64url(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    signature = _b64url(hmac.new(SECRET.encode("utf-8"), body.encode("ascii"), hashlib.sha256).digest())
+    return f"{body}.{signature}"
 
 
 class PlateRulesTests(unittest.TestCase):
@@ -392,6 +404,32 @@ class Phase11CryptoTests(unittest.TestCase):
                                                resource_type="plate_event", purpose="original_image_path"), "new")
 
 
+class ReleaseSanityTests(unittest.TestCase):
+    def test_phase_c_migration_files_are_ordered_unique_and_contiguous(self):
+        report = release_sanity.migration_sequence_report(pathlib.Path(__file__).resolve().parents[1])
+        self.assertEqual(report["invalid_names"], [])
+        self.assertEqual(report["duplicates"], [])
+        self.assertEqual(report["missing"], [])
+        self.assertTrue(report["ordered"])
+        self.assertEqual(report["numbers"], list(range(1, report["count"] + 1)))
+
+    def test_phase_c_postgresql_migration_sql_uses_supported_dialect(self):
+        report = release_sanity.migration_postgresql_compatibility_report(pathlib.Path(__file__).resolve().parents[1])
+        self.assertEqual(report["issues"], [])
+
+    def test_phase_c_fresh_sqlite_startup_creates_required_schema(self):
+        report = release_sanity.fresh_sqlite_startup_report(pathlib.Path(__file__).resolve().parents[1])
+        self.assertTrue(report.get("ok"), report)
+        self.assertGreaterEqual(report["camera_count"], 4)
+        self.assertGreaterEqual(report["user_count"], 3)
+        self.assertEqual(report["missing_tables"], [])
+        self.assertEqual(report["missing_columns"], {})
+
+    def test_phase_c_git_does_not_track_runtime_artifacts(self):
+        artifacts = release_sanity.tracked_runtime_artifacts(pathlib.Path(__file__).resolve().parents[1])
+        self.assertEqual(artifacts, [])
+
+
 class APITests(unittest.TestCase):
     def setUp(self):
         with SessionLocal() as db:
@@ -464,14 +502,276 @@ class APITests(unittest.TestCase):
                 "password": "AdminDemo!2026",
             })
             self.assertEqual(login.status_code, 200, login.text)
-            self.assertIn("anpr_session=", login.headers.get("set-cookie", ""))
+            csrf_token = login.json()["csrf_token"]
+            cookie = login.headers.get("set-cookie", "")
+            self.assertIn("anpr_session=", cookie)
+            self.assertIn("HttpOnly", cookie)
+            self.assertIn("Max-Age=", cookie)
+            self.assertIn("Path=/", cookie)
+            self.assertIn("SameSite=lax", cookie)
+            self.assertNotIn("Secure", cookie)
             self.assertEqual(browser.get("/api/cameras").status_code, 200)
             with browser.websocket_connect("/ws/events") as socket:
                 self.assertEqual(socket.receive_json()["type"], "connected")
-            self.assertEqual(browser.post("/api/auth/logout").status_code, 200)
+            self.assertEqual(browser.post("/api/auth/logout", headers={CSRF_HEADER_NAME: csrf_token}).status_code, 200)
             self.assertEqual(browser.get("/api/cameras").status_code, 401)
         finally:
             context.__exit__(None, None, None)
+
+    def test_phase_b1_rejects_tampered_and_expired_sessions(self):
+        context, anonymous = self.unauthenticated_client()
+        try:
+            tampered_payload = {
+                "sub": "admin_demo",
+                "uid": 1,
+                "role": "SYSTEM_ADMIN",
+                "iat": 1,
+                "exp": int(dt.datetime.utcnow().timestamp()) + 600,
+                "jti": "tampered",
+            }
+            tampered = signed_test_token(tampered_payload).rsplit(".", 1)[0] + ".bad-signature"
+            tampered_response = anonymous.get("/api/auth/me", headers={"Cookie": f"{COOKIE_NAME}={tampered}"})
+            self.assertEqual(tampered_response.status_code, 401)
+            self.assertNotIn(SECRET, tampered_response.text)
+            self.assertNotIn("AdminDemo!2026", tampered_response.text)
+
+            expired_payload = {
+                "sub": "admin_demo",
+                "uid": 1,
+                "role": "SYSTEM_ADMIN",
+                "iat": 1,
+                "exp": 1,
+                "jti": "expired",
+            }
+            expired_response = anonymous.get(
+                "/api/auth/me",
+                headers={"Cookie": f"{COOKIE_NAME}={signed_test_token(expired_payload)}"},
+            )
+            self.assertEqual(expired_response.status_code, 401)
+            self.assertEqual(expired_response.json()["detail"], "expired_token")
+        finally:
+            context.__exit__(None, None, None)
+
+    def test_phase_b1_websocket_query_tokens_follow_security_config(self):
+        token = self.client.post("/api/auth/login", json={
+            "username": "admin_demo",
+            "password": "AdminDemo!2026",
+        }).json()["access_token"]
+        context, anonymous = self.unauthenticated_client()
+        try:
+            with self.assertRaises(Exception):
+                anonymous.websocket_connect(f"/ws/events?token={token}").__enter__()
+            with patch.dict(os.environ, {"ANPR_ALLOW_QUERY_TOKENS": "true"}, clear=False):
+                with anonymous.websocket_connect(f"/ws/events?token={token}") as socket:
+                    self.assertEqual(socket.receive_json()["type"], "connected")
+        finally:
+            context.__exit__(None, None, None)
+
+    def test_phase_b1_frontend_keeps_cookie_first_token_storage_hygiene(self):
+        auth_source = (pathlib.Path(__file__).resolve().parents[1] / "frontend" / "auth.js").read_text()
+        dashboard_source = (pathlib.Path(__file__).resolve().parents[1] / "frontend" / "dashboard.html").read_text()
+        self.assertIn('credentials: "include"', auth_source)
+        self.assertIn('localStorage.removeItem("anpr_token")', auth_source)
+        self.assertIn('sessionStorage.removeItem("anpr_token")', auth_source)
+        self.assertNotIn("localStorage.setItem", auth_source + dashboard_source)
+        self.assertNotIn("sessionStorage.setItem", auth_source + dashboard_source)
+
+    def test_phase_b1_login_logout_security_events_are_audited(self):
+        context, browser = self.unauthenticated_client()
+        try:
+            self.assertEqual(browser.post("/api/auth/login", json={
+                "username": "admin_demo",
+                "password": "wrong-password",
+            }).status_code, 401)
+            login = browser.post("/api/auth/login", json={
+                "username": "admin_demo",
+                "password": "AdminDemo!2026",
+            })
+            self.assertEqual(login.status_code, 200)
+            self.assertEqual(browser.post("/api/auth/logout", headers={CSRF_HEADER_NAME: login.json()["csrf_token"]}).status_code, 200)
+        finally:
+            context.__exit__(None, None, None)
+        with SessionLocal() as db:
+            actions = [row.action for row in db.query(AuditLog).order_by(AuditLog.id.desc()).limit(20).all()]
+        self.assertIn("login_failure", actions)
+        self.assertIn("login_success", actions)
+        self.assertIn("logout", actions)
+
+    def assert_no_status_secret_leakage(self, payload):
+        text = json.dumps(payload, sort_keys=True)
+        forbidden_fragments = [
+            "database_path",
+            "database_url",
+            "detector_model_path",
+            "MODEL_PATH",
+            "ANPR_DATABASE",
+            "ANPR_AUTH_SECRET",
+            "ANPR_ENCRYPTION_KEY",
+            "local-sih-demo-change-me",
+            str(TEMP.name),
+            os.environ["ANPR_DATABASE_PATH"],
+            os.environ["ANPR_UPLOAD_DIR"],
+            os.environ["ANPR_ORIGINAL_EVIDENCE_DIR"],
+            os.environ["ANPR_REVIEW_DIR"],
+        ]
+        for fragment in forbidden_fragments:
+            self.assertNotIn(fragment, text)
+        self.assertNotRegex(text, r"[A-Za-z]:\\\\")
+        self.assertNotIn(".db", text)
+        self.assertNotIn("site-packages", text)
+
+    def test_phase_b2_public_system_status_is_minimal_and_safe(self):
+        context, anonymous = self.unauthenticated_client()
+        try:
+            response = anonymous.get("/api/system/status")
+        finally:
+            context.__exit__(None, None, None)
+        self.assertEqual(response.status_code, 200, response.text)
+        data = response.json()
+        self.assertEqual(set(data), {"service", "status"})
+        self.assertEqual(data["service"], "anpr-vehicle-monitoring")
+        self.assertIn(data["status"], {"ok", "degraded"})
+        self.assert_no_status_secret_leakage(data)
+
+    def test_phase_b2_system_status_details_are_admin_only_and_safe(self):
+        context, anonymous = self.unauthenticated_client()
+        try:
+            self.assertEqual(anonymous.get("/api/system/status/details").status_code, 401)
+        finally:
+            context.__exit__(None, None, None)
+
+        admin_response = self.client.get("/api/system/status/details")
+        self.assertEqual(admin_response.status_code, 200, admin_response.text)
+        data = admin_response.json()
+        self.assertEqual(data["diagnostic_scope"], "authenticated_admin")
+        self.assertEqual(data["ocr_engine"], "PaddleOCR")
+        self.assertIn("camera_count", data)
+        self.assertIn("security", data)
+        self.assert_no_status_secret_leakage(data)
+
+        self.login_as("traffic_demo", "TrafficDemo!2026")
+        self.assertEqual(self.client.get("/api/system/status/details").status_code, 403)
+        self.login_as("pcr_demo", "PcrDemo!2026")
+        self.assertEqual(self.client.get("/api/system/status/details").status_code, 403)
+
+    def test_phase_b2_public_system_status_failure_is_safe(self):
+        with patch("app.main.public_system_health", side_effect=RuntimeError(r"C:\secret\anpr_demo.db")):
+            response = self.client.get("/api/system/status")
+        self.assertEqual(response.status_code, 200, response.text)
+        data = response.json()
+        self.assertEqual(data, {"service": "anpr-vehicle-monitoring", "status": "degraded"})
+        self.assert_no_status_secret_leakage(data)
+
+    def test_phase_b3_login_rate_limit_and_retry_after(self):
+        reset_rate_limit_state()
+        context, anonymous = self.unauthenticated_client()
+        try:
+            with patch.dict(os.environ, {
+                "ANPR_RATE_LIMIT_LOGIN_MAX": "2",
+                "ANPR_RATE_LIMIT_LOGIN_WINDOW_SECONDS": "60",
+            }, clear=False):
+                first = anonymous.post("/api/auth/login", json={"username": "admin_demo", "password": "bad-1"})
+                second = anonymous.post("/api/auth/login", json={"username": "admin_demo", "password": "bad-2"})
+                limited = anonymous.post("/api/auth/login", json={"username": "admin_demo", "password": "bad-3"})
+            self.assertEqual(first.status_code, 401)
+            self.assertEqual(second.status_code, 401)
+            self.assertEqual(limited.status_code, 429)
+            self.assertEqual(limited.json()["detail"], "Too many requests")
+            self.assertGreaterEqual(int(limited.headers.get("retry-after", "0")), 1)
+            self.assertNotIn("AdminDemo!2026", limited.text)
+            self.assertNotIn(SECRET, limited.text)
+        finally:
+            context.__exit__(None, None, None)
+            reset_rate_limit_state()
+
+    def test_phase_b3_rate_limit_window_reset_and_normal_dashboard_reads(self):
+        reset_rate_limit_state()
+        context, anonymous = self.unauthenticated_client()
+        try:
+            with patch.dict(os.environ, {
+                "ANPR_RATE_LIMIT_LOGIN_MAX": "1",
+                "ANPR_RATE_LIMIT_LOGIN_WINDOW_SECONDS": "1",
+            }, clear=False):
+                self.assertEqual(anonymous.post("/api/auth/login", json={"username": "admin_demo", "password": "wrong"}).status_code, 401)
+                self.assertEqual(anonymous.post("/api/auth/login", json={"username": "admin_demo", "password": "wrong"}).status_code, 429)
+                import time
+                time.sleep(1.1)
+                self.assertEqual(anonymous.post("/api/auth/login", json={"username": "admin_demo", "password": "wrong"}).status_code, 401)
+        finally:
+            context.__exit__(None, None, None)
+            reset_rate_limit_state()
+        for _ in range(5):
+            self.assertEqual(self.client.get("/api/cameras").status_code, 200)
+
+    def test_phase_b3_processing_rate_limit_protects_high_cost_paths(self):
+        reset_rate_limit_state()
+        with patch.dict(os.environ, {
+            "ANPR_RATE_LIMIT_PROCESSING_MAX": "1",
+            "ANPR_RATE_LIMIT_PROCESSING_WINDOW_SECONDS": "60",
+        }, clear=False):
+            with patch("app.main.process_image", return_value=(None, 0.0, "failed", json.dumps([]))):
+                first = self.client.post("/api/process-frame", data={"camera_id": "CAM01"},
+                                         files={"frame": ("image.jpg", b"test", "image/jpeg")})
+                second = self.client.post("/api/process-frame", data={"camera_id": "CAM01"},
+                                          files={"frame": ("image.jpg", b"test", "image/jpeg")})
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(second.status_code, 429)
+        self.assertIn("retry-after", {k.lower(): v for k, v in second.headers.items()})
+        reset_rate_limit_state()
+
+    def test_phase_b4_cookie_session_requires_csrf_for_state_changes(self):
+        context, browser = self.unauthenticated_client()
+        try:
+            login = browser.post("/api/auth/login", json={
+                "username": "admin_demo",
+                "password": "AdminDemo!2026",
+            })
+            self.assertEqual(login.status_code, 200, login.text)
+            csrf_token = login.json()["csrf_token"]
+            missing = browser.post("/api/auth/logout")
+            self.assertEqual(missing.status_code, 403)
+            self.assertEqual(missing.json()["detail"], "CSRF validation failed")
+            wrong = browser.post("/api/auth/logout", headers={CSRF_HEADER_NAME: "wrong"})
+            self.assertEqual(wrong.status_code, 403)
+            ok = browser.post("/api/auth/logout", headers={CSRF_HEADER_NAME: csrf_token})
+            self.assertEqual(ok.status_code, 200)
+        finally:
+            context.__exit__(None, None, None)
+
+    def test_phase_b4_csrf_does_not_break_bearer_clients_or_websockets(self):
+        self.assertEqual(self.client.post("/api/auth/logout").status_code, 200)
+        token = self.login_as("admin_demo", "AdminDemo!2026")
+        context, anonymous = self.unauthenticated_client()
+        try:
+            with anonymous.websocket_connect("/ws/events", headers={"Authorization": f"Bearer {token}"}) as socket:
+                self.assertEqual(socket.receive_json()["type"], "connected")
+        finally:
+            context.__exit__(None, None, None)
+
+    def test_phase_b5_production_security_configuration_validation(self):
+        with patch.dict(os.environ, {
+            "ANPR_ENV": "production",
+            "ANPR_AUTH_SECRET": "local-sih-demo-change-me",
+            "ANPR_COOKIE_SECURE": "false",
+            "ANPR_ALLOWED_ORIGINS": "*",
+            "ANPR_EDGE_AUTH_REQUIRED": "false",
+        }, clear=False):
+            issues = validate_production_security_config()
+        self.assertTrue(any("ANPR_AUTH_SECRET" in issue for issue in issues))
+        self.assertTrue(any("ANPR_COOKIE_SECURE" in issue for issue in issues))
+        self.assertTrue(any("Wildcard CORS" in issue for issue in issues))
+        self.assertTrue(any("ANPR_EDGE_AUTH_REQUIRED" in issue for issue in issues))
+
+        with patch.dict(os.environ, {
+            "ANPR_ENV": "production",
+            "ANPR_AUTH_SECRET": "prod-secret-for-tests-only",
+            "ANPR_COOKIE_SECURE": "true",
+            "ANPR_COOKIE_SAMESITE": "lax",
+            "ANPR_ALLOWED_ORIGINS": "https://anpr.example.gov",
+            "ANPR_EDGE_AUTH_REQUIRED": "true",
+        }, clear=False):
+            self.assertEqual(validate_production_security_config(), [])
+            self.assertEqual(get_security_settings().cors_origins, ["https://anpr.example.gov"])
 
     def test_phase11_passwords_are_hashed_and_not_returned_or_audited(self):
         response = self.client.post("/api/auth/login", json={"username": "admin_demo", "password": "AdminDemo!2026"})
@@ -488,7 +788,12 @@ class APITests(unittest.TestCase):
         response = self.client.get("/api/system/status")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers.get("x-content-type-options"), "nosniff")
-        self.assertIn("frame-ancestors 'none'", response.headers.get("content-security-policy", ""))
+        csp = response.headers.get("content-security-policy", "")
+        self.assertIn("frame-ancestors 'none'", csp)
+        self.assertIn("https://*.basemaps.cartocdn.com", csp)
+        self.assertIn("https://server.arcgisonline.com", csp)
+        self.assertIn("https://unpkg.com", csp)
+        self.assertNotIn("img-src *", csp)
         self.assertNotIn("strict-transport-security", {k.lower(): v for k, v in response.headers.items()})
         with patch.dict(os.environ, {"ANPR_COOKIE_SECURE": "true", "ANPR_COOKIE_SAMESITE": "strict"}, clear=False):
             login = self.client.post("/api/auth/login", json={"username": "admin_demo", "password": "AdminDemo!2026"})
@@ -949,6 +1254,67 @@ class APITests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 resolve_location({})
 
+    def test_map_tile_configuration_endpoint_and_env_override(self):
+        response = self.client.get("/api/map/config")
+        self.assertEqual(response.status_code, 200, response.text)
+        data = response.json()
+        self.assertEqual(data["provider"], "esri_world_street")
+        self.assertEqual(
+            data["tile_url"],
+            "https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}",
+        )
+        self.assertEqual(data["subdomains"], "")
+        self.assertIn("{z}", data["tile_url"])
+        self.assertIn("server.arcgisonline.com", data["tile_url"])
+        self.assertNotIn("basemaps.cartocdn.com", data["tile_url"])
+        self.assertIn("OpenStreetMap", data["attribution"])
+        self.assertIn("Map tiles are temporarily unavailable", data["fallback_message"])
+        with patch.dict(os.environ, {
+            "ANPR_MAP_TILE_PROVIDER": "carto_light",
+            "ANPR_MAP_TILE_MAX_ZOOM": "18",
+        }):
+            config = map_tile_config()
+        self.assertEqual(config["provider"], "carto_light")
+        self.assertEqual(config["max_zoom"], 18)
+        with patch.dict(os.environ, {
+            "ANPR_MAP_TILE_URL": "https://tiles.example.test/{z}/{x}/{y}.png",
+            "ANPR_MAP_TILE_ATTRIBUTION": "Example tiles",
+        }):
+            config = map_tile_config()
+        self.assertEqual(config["provider"], "custom")
+        self.assertEqual(config["tile_url"], "https://tiles.example.test/{z}/{x}/{y}.png")
+        self.assertEqual(config["attribution"], "Example tiles")
+
+    def test_osrm_url_construction_and_response_parsing(self):
+        self.client.patch("/api/cameras/CAM01", json={"lat":23.0,"lng":72.0})
+        self.client.patch("/api/cameras/CAM02", json={"lat":23.1,"lng":72.2})
+        with SessionLocal() as db:
+            url = build_osrm_route_url(
+                db.get(Camera, "CAM01"),
+                db.get(Camera, "CAM02"),
+                base_url="http://osrm.local",
+                profile="driving",
+            )
+        self.assertEqual(
+            url,
+            "http://osrm.local/route/v1/driving/72.0,23.0;72.2,23.1"
+            "?overview=full&geometries=geojson&alternatives=false&steps=false",
+        )
+        estimate = parse_osrm_route({
+            "code": "Ok",
+            "routes": [{
+                "distance": 5123.4,
+                "duration": 600.5,
+                "geometry": {"coordinates": [[72.0, 23.0], [72.1, 23.05], [72.2, 23.1]]},
+            }],
+        })
+        self.assertEqual(estimate.distance_source, "osrm")
+        self.assertEqual(estimate.distance_meters, 5123.4)
+        self.assertEqual(estimate.duration_seconds, 600.5)
+        self.assertEqual(estimate.route_geometry[0], {"lat": 23.0, "lng": 72.0})
+        self.assertIsNone(parse_osrm_route({"code": "NoRoute", "routes": []}))
+        self.assertIsNone(parse_osrm_route({"code": "Ok", "routes": [{"distance": 0}]}))
+
     def test_camera_road_connection_crud_and_lookup(self):
         self.client.patch("/api/cameras/CAM01", json={"lat":23.0,"lng":72.0})
         self.client.patch("/api/cameras/CAM02", json={"lat":23.05,"lng":72.05})
@@ -1054,6 +1420,64 @@ class APITests(unittest.TestCase):
         self.assertAlmostEqual(segment["estimated_speed_mps"], 11.111, places=3)
         self.assertEqual(segment["speed_status"], "calculated")
 
+    def test_osrm_distance_route_and_source_override_manual_connection(self):
+        self.client.patch("/api/cameras/CAM01", json={"lat":23.0,"lng":72.0})
+        self.client.patch("/api/cameras/CAM02", json={"lat":23.1,"lng":72.2})
+        self.client.post("/api/camera-road-connections", json={
+            "source_camera_id":"CAM01","destination_camera_id":"CAM02","distance_meters":4200,
+        })
+        first = persist_plate_event(dict(camera_id="CAM01",plate_text="GJ01AB1234",confidence=.95,status="ok"))[0]
+        second = persist_plate_event(dict(camera_id="CAM02",plate_text="GJ01AB1234",confidence=.95,status="ok"))[0]
+        start = dt.datetime(2026, 9, 13, 10, 0, 0)
+        payload = {
+            "code": "Ok",
+            "routes": [{
+                "distance": 5000,
+                "duration": 420,
+                "geometry": {"coordinates": [[72.0, 23.0], [72.1, 23.05], [72.2, 23.1]]},
+            }],
+        }
+        with patch.dict(os.environ, {"ANPR_OSRM_BASE_URL": "http://osrm.local"}):
+            with patch("app.road_network.OSRMRoutingProvider._fetch_json", return_value=payload):
+                with SessionLocal() as db:
+                    db.get(PlateEvent, first.id).timestamp = start
+                    db.get(PlateEvent, second.id).timestamp = start + dt.timedelta(seconds=500)
+                    db.commit()
+                    segment = calculate_travel_segment(db, db.get(PlateEvent, first.id), db.get(PlateEvent, second.id))
+        self.assertEqual(segment["distance_source"], "osrm")
+        self.assertEqual(segment["routing_source"], "osrm")
+        self.assertEqual(segment["configured_distance_meters"], 4200)
+        self.assertEqual(segment["distance_meters"], 5000)
+        self.assertEqual(segment["route_duration_seconds"], 420)
+        self.assertEqual(len(segment["route_geometry"]), 3)
+        self.assertAlmostEqual(segment["estimated_speed_kmh"], 36.0, places=2)
+
+    def test_osrm_timeout_error_and_invalid_response_fall_back_to_manual(self):
+        self.client.patch("/api/cameras/CAM01", json={"lat":23.0,"lng":72.0})
+        self.client.patch("/api/cameras/CAM02", json={"lat":23.1,"lng":72.2})
+        self.client.post("/api/camera-road-connections", json={
+            "source_camera_id":"CAM01","destination_camera_id":"CAM02","distance_meters":4200,
+        })
+        first = persist_plate_event(dict(camera_id="CAM01",plate_text="GJ01AB1234",confidence=.95,status="ok"))[0]
+        second = persist_plate_event(dict(camera_id="CAM02",plate_text="GJ01AB1234",confidence=.95,status="ok"))[0]
+        with SessionLocal() as db:
+            db.get(PlateEvent, first.id).timestamp = dt.datetime(2026, 9, 13, 10, 0, 0)
+            db.get(PlateEvent, second.id).timestamp = dt.datetime(2026, 9, 13, 10, 6, 18)
+            db.commit()
+        with patch.dict(os.environ, {"ANPR_OSRM_BASE_URL": "http://osrm.local"}):
+            with patch("app.road_network.OSRMRoutingProvider._fetch_json", side_effect=TimeoutError("slow route")):
+                with SessionLocal() as db:
+                    segment = calculate_travel_segment(db, db.get(PlateEvent, first.id), db.get(PlateEvent, second.id))
+        self.assertEqual(segment["distance_source"], "manual")
+        self.assertEqual(segment["routing_source"], "manual")
+        self.assertEqual(segment["distance_meters"], 4200)
+        with patch.dict(os.environ, {"ANPR_OSRM_BASE_URL": "http://osrm.local"}):
+            with patch("app.road_network.OSRMRoutingProvider._fetch_json", return_value={"code": "NoRoute"}):
+                with SessionLocal() as db:
+                    segment = calculate_travel_segment(db, db.get(PlateEvent, first.id), db.get(PlateEvent, second.id))
+        self.assertEqual(segment["distance_source"], "manual")
+        self.assertIsNone(segment["route_geometry"])
+
     def test_zero_and_negative_travel_time_rejected(self):
         self.client.post("/api/camera-road-connections", json={
             "source_camera_id":"CAM01","destination_camera_id":"CAM02","distance_meters":4200,
@@ -1123,6 +1547,38 @@ class APITests(unittest.TestCase):
         self.assertEqual(hop["travel_time_seconds"], 378)
         self.assertAlmostEqual(hop["estimated_speed_kmh"], 40.0, places=2)
         self.assertEqual(route["speed_summary"]["valid_speed_segments"], 1)
+
+    def test_trajectory_reports_osrm_routing_source_and_geometry(self):
+        self.client.patch("/api/cameras/CAM01", json={"lat":23.0,"lng":72.0})
+        self.client.patch("/api/cameras/CAM02", json={"lat":23.1,"lng":72.2})
+        self.client.post("/api/camera-road-connections", json={
+            "source_camera_id":"CAM01","destination_camera_id":"CAM02","distance_meters":4200,
+        })
+        first = persist_plate_event(dict(camera_id="CAM01",plate_text="GJ01AB1234",confidence=.95,status="ok"))[0]
+        second = persist_plate_event(dict(camera_id="CAM02",plate_text="GJ01AB1234",confidence=.95,status="ok"))[0]
+        start = dt.datetime(2026, 9, 13, 10, 0, 0)
+        with SessionLocal() as db:
+            db.get(PlateEvent, first.id).timestamp = start
+            db.get(PlateEvent, second.id).timestamp = start + dt.timedelta(seconds=500)
+            db.commit()
+        payload = {
+            "code": "Ok",
+            "routes": [{
+                "distance": 5000,
+                "duration": 420,
+                "geometry": {"coordinates": [[72.0, 23.0], [72.2, 23.1]]},
+            }],
+        }
+        with patch.dict(os.environ, {"ANPR_OSRM_BASE_URL": "http://osrm.local"}):
+            with patch("app.road_network.OSRMRoutingProvider._fetch_json", return_value=payload):
+                route = self.client.get("/api/trajectory/GJ01AB1234").json()
+        hop = route["hops"][1]
+        segment = route["trajectory_hops"][0]
+        self.assertEqual(hop["road_distance_source"], "osrm")
+        self.assertEqual(segment["routing_source"], "osrm")
+        self.assertEqual(segment["road_connection"]["routing_source"], "osrm")
+        self.assertEqual(segment["route_geometry"][0], {"lat": 23.0, "lng": 72.0})
+        self.assertEqual(segment["road_connection"]["route_geometry"][1], {"lat": 23.1, "lng": 72.2})
 
     def test_vehicle_speed_history_average_ignores_unavailable_segments(self):
         self.client.post("/api/camera-road-connections", json={

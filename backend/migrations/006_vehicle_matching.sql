@@ -1,5 +1,5 @@
 CREATE TABLE IF NOT EXISTS vehicle_match_candidates (
-    id INTEGER PRIMARY KEY,
+    id SERIAL PRIMARY KEY,
     observation_a_id INTEGER NOT NULL,
     observation_b_id INTEGER NOT NULL,
     candidate_vehicle_id VARCHAR,
@@ -19,8 +19,8 @@ CREATE TABLE IF NOT EXISTS vehicle_match_candidates (
     review_status VARCHAR NOT NULL DEFAULT 'not_required',
     matching_model VARCHAR NOT NULL DEFAULT 'vehicle-match-v1',
     matching_version VARCHAR NOT NULL DEFAULT '2B-2026-09-12',
-    created_at DATETIME NOT NULL,
-    reviewed_at DATETIME,
+    created_at TIMESTAMP NOT NULL,
+    reviewed_at TIMESTAMP,
     reviewed_by VARCHAR,
     CONSTRAINT uq_vehicle_match_pair UNIQUE (observation_a_id, observation_b_id)
 );

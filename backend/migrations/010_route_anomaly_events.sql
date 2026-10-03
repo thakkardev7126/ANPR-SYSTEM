@@ -1,5 +1,5 @@
 CREATE TABLE IF NOT EXISTS route_anomaly_events (
-    id INTEGER PRIMARY KEY,
+    id SERIAL PRIMARY KEY,
     vehicle_id VARCHAR NOT NULL,
     plate_text VARCHAR(24),
     start_event_id INTEGER NOT NULL,
@@ -12,9 +12,9 @@ CREATE TABLE IF NOT EXISTS route_anomaly_events (
     status VARCHAR NOT NULL DEFAULT 'open',
     evidence TEXT NOT NULL,
     explanation TEXT NOT NULL,
-    created_at DATETIME NOT NULL,
-    updated_at DATETIME NOT NULL,
-    reviewed_at DATETIME,
+    created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL,
+    reviewed_at TIMESTAMP,
     reviewed_by VARCHAR,
     CONSTRAINT uq_route_anomaly_window UNIQUE (vehicle_id, start_event_id, end_event_id)
 );

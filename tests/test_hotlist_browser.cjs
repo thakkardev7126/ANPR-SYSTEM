@@ -30,7 +30,7 @@ const pixel = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQ
   try {
     let ready=false;
     for(let i=0;i<60;i++) {
-      try { const res=await fetch(base+"/api/hotlist"); if(res.ok) {ready=true;break;} } catch {}
+      try { const res=await fetch(base+"/api/system/status"); if(res.ok) {ready=true;break;} } catch {}
       await new Promise(resolve=>setTimeout(resolve,250));
     }
     assert(ready,serverLog);
@@ -39,6 +39,11 @@ const pixel = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQ
       const camera = i ? "CAM02" : "CAM01";
       const plate = i ? "GJ01AB5678" : "GJ01AB1234";
       const context=await browser.newContext({viewport,ignoreHTTPSErrors:true});
+      const login = await context.request.post(base+"/api/auth/login", {
+        data: {username:"admin_demo", password:"AdminDemo!2026"}
+      });
+      assert.equal(login.ok(), true, "hotlist browser test login must establish the session cookie");
+      const csrfHeaders = {"X-CSRF-Token": (await login.json()).csrf_token};
       const page=await context.newPage();
       const errors=[];
       page.on("pageerror",error=>errors.push(error.message));
@@ -53,7 +58,7 @@ const pixel = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQ
       await page.uncheck("#entryActive");
       await page.click("#saveEntry");
       await page.waitForFunction(()=>!document.querySelector("#entryDialog").open);
-      const ignored=await context.request.post(base+"/api/scan",{multipart:{camera_id:camera,file:{name:"test.png",mimeType:"image/png",buffer:pixel}}});
+      const ignored=await context.request.post(base+"/api/scan",{headers:csrfHeaders,multipart:{camera_id:camera,file:{name:"test.png",mimeType:"image/png",buffer:pixel}}});
       assert.equal((await ignored.json()).hotlist_alerts.length,0);
       await page.getByRole("button",{name:`Edit ${plate}`,exact:true}).click();
       await page.check("#entryActive");
@@ -71,7 +76,7 @@ const pixel = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQ
       await page.screenshot({path:path.join(out,`hotlist-popup-${viewport.width}.png`),fullPage:true});
       await page.reload();
       await page.waitForSelector(".hotlist-popup");
-      const repeated=await context.request.post(base+"/api/process-frame",{multipart:{camera_id:camera,frame:{name:"test.png",mimeType:"image/png",buffer:pixel}}});
+      const repeated=await context.request.post(base+"/api/process-frame",{headers:csrfHeaders,multipart:{camera_id:camera,frame:{name:"test.png",mimeType:"image/png",buffer:pixel}}});
       assert.equal((await repeated.json()).hotlist_alerts.length,1);
       assert.equal(await page.locator(".hotlist-popup").count(),1);
       await page.locator(".hotlist-popup button").click();

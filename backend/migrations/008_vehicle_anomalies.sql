@@ -1,5 +1,5 @@
 CREATE TABLE IF NOT EXISTS vehicle_anomalies (
-    id INTEGER PRIMARY KEY,
+    id SERIAL PRIMARY KEY,
     vehicle_id VARCHAR,
     plate_text VARCHAR(24),
     anomaly_type VARCHAR NOT NULL,
@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS vehicle_anomalies (
     destination_event_id INTEGER NOT NULL,
     source_camera_id VARCHAR NOT NULL,
     destination_camera_id VARCHAR NOT NULL,
-    detected_at DATETIME NOT NULL,
+    detected_at TIMESTAMP NOT NULL,
     travel_time_seconds FLOAT,
     road_distance_meters FLOAT,
     estimated_speed_kmh FLOAT,
@@ -19,9 +19,9 @@ CREATE TABLE IF NOT EXISTS vehicle_anomalies (
     road_name VARCHAR,
     policy TEXT,
     explanation TEXT NOT NULL,
-    created_at DATETIME NOT NULL,
-    acknowledged_at DATETIME,
-    resolved_at DATETIME,
+    created_at TIMESTAMP NOT NULL,
+    acknowledged_at TIMESTAMP,
+    resolved_at TIMESTAMP,
     CONSTRAINT uq_vehicle_anomaly_pair UNIQUE (anomaly_type, source_event_id, destination_event_id)
 );
 

@@ -4,6 +4,7 @@
     ? `${location.protocol}//${location.hostname}:8000`
     : location.origin;
   let currentUser = null;
+  let csrfToken = null;
   const listeners = new Set();
 
   function notify() {
@@ -29,14 +30,20 @@
   async function request(path, options = {}, timeoutMs = 8000) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(new DOMException("Request timed out", "TimeoutError")), timeoutMs);
+    const method = (options.method || "GET").toUpperCase();
+    const headers = { ...(options.headers || {}) };
+    if (csrfToken && ["POST", "PUT", "PATCH", "DELETE"].includes(method) && !headers["X-CSRF-Token"]) {
+      headers["X-CSRF-Token"] = csrfToken;
+    }
     try {
       const response = await fetch(url(path), {
         ...options,
         credentials: "include",
-        headers: options.headers || {},
+        headers,
         signal: controller.signal,
       });
       if (response.status === 401) {
+        csrfToken = null;
         setUser(null);
         window.dispatchEvent(new CustomEvent("anpr-auth-required"));
       }
@@ -50,10 +57,12 @@
     clearLegacyTokens();
     const response = await request("/api/auth/me", {}, 6000);
     if (!response.ok) {
+      csrfToken = null;
       setUser(null);
       return null;
     }
     const data = await response.json();
+    csrfToken = data.csrf_token || null;
     return setUser(data.user);
   }
 
@@ -66,6 +75,7 @@
     }, 8000);
     if (!response.ok) throw new Error("Login failed");
     const data = await response.json();
+    csrfToken = data.csrf_token || null;
     return setUser(data.user);
   }
 
@@ -74,6 +84,7 @@
       await request("/api/auth/logout", { method: "POST" }, 6000);
     } finally {
       clearLegacyTokens();
+      csrfToken = null;
       setUser(null);
     }
   }

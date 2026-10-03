@@ -48,6 +48,7 @@ DEMO_USERS = [
 
 TOKEN_TTL_SECONDS = int(os.getenv("ANPR_AUTH_TOKEN_TTL_SECONDS", "28800"))
 COOKIE_NAME = "anpr_session"
+CSRF_HEADER_NAME = "x-csrf-token"
 SECRET = os.getenv("ANPR_AUTH_SECRET", "local-sih-demo-change-me")
 if os.getenv("ANPR_ENV", "development").strip().lower() == "production" and SECRET == "local-sih-demo-change-me":
     raise RuntimeError("ANPR_AUTH_SECRET must be configured in production")
@@ -197,6 +198,38 @@ def token_from_request(request):
     return request.cookies.get(COOKIE_NAME)
 
 
+def csrf_token_for_session(session_token):
+    digest = hmac.new(
+        SECRET.encode("utf-8"),
+        f"csrf:{session_token}".encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+    return _b64url(digest)
+
+
+def _uses_bearer_auth(request):
+    return request.headers.get("authorization", "").lower().startswith("bearer ")
+
+
+def _csrf_required(request):
+    if request.method.upper() not in {"POST", "PUT", "PATCH", "DELETE"}:
+        return False
+    path = request.url.path
+    if not path.startswith("/api/") or path == "/api/auth/login":
+        return False
+    return bool(request.cookies.get(COOKIE_NAME)) and not _uses_bearer_auth(request)
+
+
+async def csrf_middleware(request, call_next):
+    if _csrf_required(request):
+        session_token = request.cookies.get(COOKIE_NAME)
+        expected = csrf_token_for_session(session_token)
+        supplied = request.headers.get(CSRF_HEADER_NAME, "")
+        if not supplied or not hmac.compare_digest(supplied, expected):
+            return JSONResponse({"detail": "CSRF validation failed"}, status_code=403)
+    return await call_next(request)
+
+
 def authenticate_request_user(request, db):
     token = token_from_request(request)
     if not token:
@@ -253,6 +286,7 @@ def _policy(method, pattern, permission, action, resource_type):
 ROUTE_POLICIES = [
     _policy("GET", r"^/api/auth/me$", "event:read", "session_lookup", "auth"),
     _policy("POST", r"^/api/auth/logout$", "event:read", "logout", "auth"),
+    _policy("GET", r"^/api/system/status/details$", "rbac:write", "system_diagnostics_lookup", "system"),
     _policy("GET", r"^/api/audit/?$", "audit:read", "audit_log_access", "audit_log"),
     _policy("GET", r"^/api/audit/verify$", "audit:read", "audit_chain_verify", "audit_log"),
     _policy("GET", r"^/api/users/?$", "rbac:write", "user_list", "user"),
@@ -392,7 +426,10 @@ async def authenticate_websocket(websocket):
         token = auth.split(None, 1)[1].strip()
     else:
         token = None
-    token = token or websocket.query_params.get("token") or websocket.cookies.get(COOKIE_NAME)
+    settings = get_security_settings()
+    if settings.auth_query_tokens:
+        token = token or websocket.query_params.get("token")
+    token = token or websocket.cookies.get(COOKIE_NAME)
     if not token:
         await websocket.close(code=1008)
         return None
@@ -441,6 +478,7 @@ def login(body: LoginInput, request: Request, response: Response, db: Session = 
         "access_token": token,
         "token_type": "bearer",
         "expires_at": dt.datetime.utcfromtimestamp(expires_at).isoformat() + "Z",
+        "csrf_token": csrf_token_for_session(token),
         "user": user_payload(user),
         "demo_credentials": [
             {"username": username, "role": role}
@@ -465,7 +503,12 @@ def me(request: Request, db: Session = Depends(get_db)):
     user, reason = authenticate_request_user(request, db)
     if not user:
         raise HTTPException(status_code=401, detail=reason or "Authentication required")
-    return {"user": user_payload(user), "permissions": sorted(PERMISSIONS_BY_ROLE.get(user.role, set()))}
+    token = token_from_request(request)
+    return {
+        "user": user_payload(user),
+        "permissions": sorted(PERMISSIONS_BY_ROLE.get(user.role, set())),
+        "csrf_token": csrf_token_for_session(token) if token else None,
+    }
 
 
 @router.get("/audit")

@@ -1,5 +1,5 @@
 CREATE TABLE IF NOT EXISTS plate_suspicion_events (
-    id INTEGER PRIMARY KEY,
+    id SERIAL PRIMARY KEY,
     plate_text VARCHAR(24) NOT NULL,
     vehicle_id VARCHAR,
     source_event_id INTEGER NOT NULL,
@@ -11,9 +11,9 @@ CREATE TABLE IF NOT EXISTS plate_suspicion_events (
     status VARCHAR NOT NULL DEFAULT 'open',
     evidence TEXT NOT NULL,
     appearance_similarity FLOAT,
-    created_at DATETIME NOT NULL,
-    updated_at DATETIME NOT NULL,
-    reviewed_at DATETIME,
+    created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL,
+    reviewed_at TIMESTAMP,
     reviewed_by VARCHAR,
     CONSTRAINT uq_plate_suspicion_pair UNIQUE (plate_text, source_event_id, destination_event_id)
 );

@@ -134,8 +134,9 @@ from app.road_network import (
     road_connection_payload,
     update_connection,
 )
+from app.map_config import map_tile_config
 from app.seed_cameras import seed as seed_cameras
-from app.auth import authenticate_websocket, permission_allowed, rbac_middleware, router as auth_router, seed_demo_users
+from app.auth import authenticate_websocket, csrf_middleware, permission_allowed, rbac_middleware, router as auth_router, seed_demo_users
 from app.privacy import create_privacy_safe_derivative, mask_privacy_regions, metadata_json
 from app.crypto import (
     DecryptionError,
@@ -148,11 +149,12 @@ from app.security import (
     body_size_limit_middleware,
     production_requires_encryption,
     public_security_status,
+    rate_limit_middleware,
     resolve_under_root,
     security_headers_middleware,
     validate_image_size,
 )
-from app.security_config import get_security_settings
+from app.security_config import get_security_settings, require_production_security_config
 
 UPLOAD_DIR = os.getenv("ANPR_UPLOAD_DIR", os.path.join(os.path.dirname(__file__), "..", "uploads"))
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -192,10 +194,13 @@ app = FastAPI(title="City-Wide ANPR Trajectory Tracking — Demo API", lifespan=
 app.middleware("http")(rbac_middleware)
 app.middleware("http")(security_headers_middleware)
 app.middleware("http")(body_size_limit_middleware)
+app.middleware("http")(rate_limit_middleware)
+app.middleware("http")(csrf_middleware)
 app.include_router(auth_router)
 app.include_router(hotlist_router)
 app.include_router(enforcement_router)
 
+require_production_security_config()
 security_settings = get_security_settings()
 app.add_middleware(
     CORSMiddleware,
@@ -222,20 +227,43 @@ async def warm_up_ocr_models():
         logging.exception("OCR model warm-up failed; the first scan will load models lazily")
 
 
-@app.get("/api/system/status")
-def system_status(db: Session = Depends(get_db)):
-    """Show the runtime configuration used by the local demo."""
+def public_system_health():
     return {
-        "database_path": DATABASE_PATH,
-        "database_url": DATABASE_URL,
-        "detector_model_path": MODEL_PATH,
+        "service": "anpr-vehicle-monitoring",
+        "status": "ok",
+    }
+
+
+@app.get("/api/system/status")
+def system_status():
+    """Public health check with no filesystem, database or model configuration details."""
+    try:
+        return public_system_health()
+    except Exception:
+        logging.warning("Public system health check failed")
+        return {
+            "service": "anpr-vehicle-monitoring",
+            "status": "degraded",
+        }
+
+
+@app.get("/api/system/status/details")
+def system_status_details(db: Session = Depends(get_db)):
+    """Admin-only diagnostics without secrets, filesystem paths or connection strings."""
+    status = "ok"
+    camera_count = None
+    try:
+        camera_count = db.query(Camera).count()
+    except Exception:
+        logging.warning("Could not calculate system diagnostic camera count")
+        status = "degraded"
+    return {
+        "service": "anpr-vehicle-monitoring",
+        "status": status,
+        "diagnostic_scope": "authenticated_admin",
         "ocr_engine": "PaddleOCR",
         "ocr_accept_confidence": OCR_ACCEPT_CONFIDENCE,
-        "camera_count": db.query(Camera).count(),
-        "cameras": [
-            {"camera_id": c.camera_id, "label": c.label, "lat": camera_location(c)[0], "lng": camera_location(c)[1], "location_known": bool(c.location_known)}
-            for c in db.query(Camera).order_by(Camera.camera_id.asc()).all()
-        ],
+        "camera_count": camera_count,
         "security": public_security_status(),
     }
 
@@ -1543,6 +1571,11 @@ def disable_camera_road_connection(connection_id: int, db: Session = Depends(get
         raise HTTPException(status_code=404, detail="Road connection not found")
     db.commit()
     return payload
+
+
+@app.get("/api/map/config")
+def get_map_config():
+    return map_tile_config()
 
 
 @app.post("/api/cameras/{camera_id}/connect")

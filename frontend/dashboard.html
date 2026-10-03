@@ -9,6 +9,7 @@
 <style>
   :root { --accent:#1F4E79; --bg:#0b0d12; --card:#141821; --border:#232837; --text:#eef1f5; --muted:#8b93a0; --ok:#2fae66; --warn:#d9a441; --bad:#d9534f; }
   * { box-sizing:border-box; }
+  html, body { max-width:100%; overflow-x:hidden; }
   body { margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,Segoe UI,Roboto,sans-serif; }
   header { padding:20px 28px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px;}
   header h1 { font-size:18px; margin:0; }
@@ -27,7 +28,7 @@
   .clear-button:hover { background:rgba(217,83,79,0.12); }
   main { display:grid; grid-template-columns: 320px 1fr; gap:0; min-height:calc(100vh - 78px); }
   @media (max-width: 860px) { main { grid-template-columns: 1fr; } }
-  .panel { padding:20px; }
+  .panel { padding:20px; min-width:0; }
   .panel h2 { font-size:13px; color:var(--muted); text-transform:uppercase; letter-spacing:0.06em; margin:0 0 14px; }
   .vehicle-list { border-right:1px solid var(--border); }
   .vehicle-item { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:12px 14px; margin-bottom:10px; cursor:pointer; transition:border-color .15s; }
@@ -36,6 +37,8 @@
   .vehicle-item .meta, .search-hit .meta { font-size:11px; color:var(--muted); margin-top:4px; }
   .map-wrap { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:0; margin-bottom:20px; overflow:hidden; }
   #leafletMap { width:100%; height:360px; background:#050608; }
+  #mapStatus { padding:8px 10px; color:var(--muted); font-size:12px; border-top:1px solid var(--border); }
+  #mapStatus.warn { color:var(--warn); }
   .hop-list { display:flex; flex-direction:column; gap:8px; }
   .hop { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:12px 14px; display:flex; justify-content:space-between; align-items:center; }
   .hop.implausible { border-color:var(--bad); }
@@ -45,6 +48,7 @@
   .badge.ok { background:rgba(47,174,102,0.15); color:var(--ok); }
   .badge.warn { background:rgba(217,164,65,0.15); color:var(--warn); }
   .badge.bad { background:rgba(217,83,79,0.15); color:var(--bad); }
+  .badge.info { background:rgba(87,166,255,0.15); color:#57a6ff; }
   .empty { color:var(--muted); font-size:13px; padding:20px; text-align:center; }
   .live-wrap { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:16px; margin-bottom:20px; }
   .live-toolbar { display:flex; gap:10px; align-items:center; margin-bottom:12px; }
@@ -58,9 +62,9 @@
   .review-item { background:var(--card); border:1px solid rgba(217,164,65,0.45); border-radius:10px; padding:10px; display:grid; grid-template-columns:120px 1fr; gap:10px; }
   .review-item img { width:120px; height:112px; object-fit:cover; border-radius:7px; background:#050608; }
   .review-body { min-width:0; }
-  .review-row { display:flex; gap:8px; margin-top:8px; }
+  .review-row { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; min-width:0; }
   .review-row input { flex:1; min-width:0; padding:8px; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:7px; text-transform:uppercase; }
-  .review-row button { padding:8px 10px; background:var(--warn); color:#141821; border:0; border-radius:7px; font-weight:700; cursor:pointer; }
+  .review-row button { padding:8px 10px; background:var(--warn); color:#141821; border:0; border-radius:7px; font-weight:700; cursor:pointer; min-width:0; }
   .search-wrap { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:12px; margin-bottom:20px; }
   .search-row { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:8px; }
   .search-row label { display:grid; gap:4px; font-size:12px; }
@@ -102,7 +106,7 @@
       <div class="stat"><div class="n" id="statScans">0</div><div class="l">scans</div></div>
       <div class="stat"><div class="n" id="statVehicles">0</div><div class="l">vehicles</div></div>
       <div class="stat"><div class="n" id="statReview">0</div><div class="l">needs review</div></div>
-      <div class="stat"><div class="n" id="statSecurity">DEV</div><div class="l">security</div></div>
+      <div class="stat"><div class="n" id="statSecurity">DEV</div><div class="l">security controls</div></div>
     </div>
     <button class="clear-button" id="clearHistory" type="button">Clear scan history</button>
   </div>
@@ -128,7 +132,7 @@
         <span id="locationStatus" role="status"></span>
       </form>
       <div class="stream-stage">
-        <img id="liveFrame" alt="Live camera frame">
+        <img id="liveFrame" alt="Live camera frame" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==">
         <canvas id="overlay"></canvas>
         <div id="streamEmpty" class="stream-empty">Select a connected camera node to view its live feed.</div>
       </div>
@@ -138,10 +142,12 @@
       <div class="empty">No configured camera road connections.</div>
     </div>
     <h2>Urban traffic analytics</h2>
+    <div class="incident-note" style="margin-bottom:10px">ANPR-derived traffic estimates from persisted observations and trajectories. Speeds are camera-to-camera estimated averages, not instantaneous vehicle speed.</div>
     <div id="trafficAnalytics" class="review-list">
       <div class="empty">Traffic analytics will appear after observations are available.</div>
     </div>
     <h2>Edge &amp; Scalability</h2>
+    <div class="incident-note" style="margin-bottom:10px">500+ camera simulation demonstrates ingestion architecture; this local demo is not connected to 500 physical live feeds.</div>
     <div id="edgeScalability" class="review-list">
       <div class="empty">Edge processing metrics will appear after the backend is reachable.</div>
     </div>
@@ -154,6 +160,7 @@
       <div id="edgeAdminStatus" class="meta" style="margin-top:10px"></div>
     </div>
     <h2>Smart Traffic Signals</h2>
+    <div class="incident-note" style="margin-bottom:10px">SIMULATION MODE - NO REAL TRAFFIC SIGNAL CONTROL. Recommendations are generated from demo analytics only.</div>
     <div id="smartSignals" class="review-list">
       <div class="empty">Signal recommendations will appear after traffic analytics are available.</div>
     </div>
@@ -169,6 +176,7 @@
       <div id="signalStatus" class="meta" style="margin-top:10px"></div>
     </div>
     <h2>Law Enforcement / PCR Alerts</h2>
+    <div class="incident-note" style="margin-bottom:10px">DEMO enforcement workflow. Nearest-PCR suggestions use simulated or manually updated PCR GPS and do not confirm dispatch or interception.</div>
     <div id="incidentList" class="review-list">
       <div class="empty">No active hotlist incidents.</div>
     </div>
@@ -232,6 +240,7 @@
     <h2>Trajectory</h2>
     <div class="map-wrap">
       <div id="leafletMap"></div>
+      <div id="mapStatus">Map provider loading...</div>
     </div>
     <div id="hopList" class="hop-list">
       <div class="empty">Select a vehicle on the left to see its path.</div>
@@ -275,6 +284,8 @@ let streamConnected = false;
 let leafletMap = null;
 let cameraLayer = null;
 let routeLayer = null;
+let mapTileLayer = null;
+let mapTileErrorShown = false;
 let enforcementLayer = null;
 let trafficHeatmap = [];
 let lawIncidents = [];
@@ -286,6 +297,25 @@ let latestSignalRecommendation = null;
 const liveFrame = document.getElementById("liveFrame");
 const overlay = document.getElementById("overlay");
 const streamEmpty = document.getElementById("streamEmpty");
+const DEFAULT_MAP_TILE_CONFIG = {
+  provider: "esri_world_street",
+  tile_url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}",
+  attribution: 'Tiles &copy; <a href="https://www.esri.com/">Esri</a> and contributors; data &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+  subdomains: "",
+  max_zoom: 19,
+  fallback_message: "Map tiles are temporarily unavailable. Camera markers and trajectory data are still shown.",
+};
+let mapTileConfig = DEFAULT_MAP_TILE_CONFIG;
+let mapTileConfigLoaded = false;
+
+function configureLeafletDefaultIcons() {
+  if (!window.L?.Icon?.Default) return;
+  L.Icon.Default.mergeOptions({
+    iconRetinaUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png",
+    iconUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png",
+    shadowUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png",
+  });
+}
 
 async function fetchJSON(path) {
   const res = await fetchWithTimeout(`${API_BASE}${path}`);
@@ -397,26 +427,223 @@ function waitForEventSocket(timeoutMs = 900) {
   });
 }
 
+function setMapStatus(message, isWarning = false) {
+  const status = document.getElementById("mapStatus");
+  if (!status) return;
+  status.textContent = message;
+  status.className = isWarning ? "warn" : "";
+}
+
+function applyMapTileLayer() {
+  if (!leafletMap || !window.L) return;
+  if (mapTileLayer) leafletMap.removeLayer(mapTileLayer);
+  mapTileErrorShown = false;
+  const config = { ...DEFAULT_MAP_TILE_CONFIG, ...(mapTileConfig || {}) };
+  mapTileLayer = L.tileLayer(config.tile_url, {
+    attribution: config.attribution,
+    maxZoom: config.max_zoom || 19,
+    subdomains: config.subdomains || "abc",
+    crossOrigin: true,
+  });
+  mapTileLayer.on("tileload", () => {
+    if (!mapTileErrorShown) setMapStatus(`Map tiles: ${config.provider || "configured provider"}`);
+  });
+  mapTileLayer.on("tileerror", () => {
+    if (mapTileErrorShown) return;
+    mapTileErrorShown = true;
+    setMapStatus(config.fallback_message || DEFAULT_MAP_TILE_CONFIG.fallback_message, true);
+  });
+  mapTileLayer.addTo(leafletMap);
+}
+
+async function loadMapConfig() {
+  if (mapTileConfigLoaded) return;
+  try {
+    mapTileConfig = { ...DEFAULT_MAP_TILE_CONFIG, ...(await fetchJSON("/api/map/config")) };
+  } catch (error) {
+    mapTileConfig = DEFAULT_MAP_TILE_CONFIG;
+    setMapStatus("Using built-in map tile fallback configuration.", true);
+  } finally {
+    mapTileConfigLoaded = true;
+  }
+  applyMapTileLayer();
+}
+
 function initLeafletMap() {
   if (!window.L || leafletMap) return;
+  configureLeafletDefaultIcons();
   leafletMap = L.map("leafletMap", { zoomControl: true }).setView([23.034, 72.55], 12);
-  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-    attribution: "&copy; OpenStreetMap contributors",
-    maxZoom: 19,
-  }).addTo(leafletMap);
+  applyMapTileLayer();
   cameraLayer = L.layerGroup().addTo(leafletMap);
   routeLayer = L.layerGroup().addTo(leafletMap);
   enforcementLayer = L.layerGroup().addTo(leafletMap);
 }
 
-function renderMap(hops) {
+function validLatLng(lat, lng) {
+  const parsedLat = Number(lat);
+  const parsedLng = Number(lng);
+  if (!Number.isFinite(parsedLat) || !Number.isFinite(parsedLng)) return null;
+  if (parsedLat < -90 || parsedLat > 90 || parsedLng < -180 || parsedLng > 180) return null;
+  return [parsedLat, parsedLng];
+}
+
+function pointKey(lat, lng) {
+  return `${Number(lat).toFixed(6)},${Number(lng).toFixed(6)}`;
+}
+
+function pointSame(a, b) {
+  return Boolean(a && b && pointKey(a[0], a[1]) === pointKey(b[0], b[1]));
+}
+
+function observationPoint(item) {
+  if (!item) return null;
+  return validLatLng(item.lat ?? item.latitude, item.lng ?? item.longitude);
+}
+
+function formatTimestamp(value) {
+  if (!value) return "time unavailable";
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? "time unavailable" : parsed.toLocaleString();
+}
+
+function normalizeRouteGeometry(geometry) {
+  if (!Array.isArray(geometry)) return [];
+  return geometry.map(point => {
+    if (!point) return null;
+    if (typeof point === "object" && !Array.isArray(point)) {
+      return validLatLng(point.lat ?? point.latitude, point.lng ?? point.longitude);
+    }
+    if (Array.isArray(point) && point.length >= 2) {
+      const first = Number(point[0]);
+      const second = Number(point[1]);
+      if (!Number.isFinite(first) || !Number.isFinite(second)) return null;
+      const direct = validLatLng(first, second);
+      const swapped = validLatLng(second, first);
+      if (!direct) return swapped;
+      if (!swapped) return direct;
+      return Math.abs(first) > 60 && Math.abs(second) < 60 ? swapped : direct;
+    }
+    return null;
+  }).filter(Boolean);
+}
+
+function buildTrajectoryStops(hops = []) {
+  const stops = new Map();
+  hops.forEach((hop, index) => {
+    const point = observationPoint(hop);
+    if (!point) return;
+    const key = hop.camera_id || pointKey(point[0], point[1]);
+    if (!stops.has(key)) {
+      stops.set(key, {
+        key,
+        camera_id: hop.camera_id || "Unknown camera",
+        camera_label: hop.camera_label || hop.label || hop.camera_id || "Camera",
+        lat: point[0],
+        lng: point[1],
+        firstIndex: index,
+        firstTimestamp: hop.timestamp,
+        lastTimestamp: hop.timestamp,
+        observations: [],
+      });
+    }
+    const stop = stops.get(key);
+    stop.observations.push(hop);
+    if (!stop.firstTimestamp || (hop.timestamp && new Date(hop.timestamp) < new Date(stop.firstTimestamp))) {
+      stop.firstTimestamp = hop.timestamp;
+    }
+    if (!stop.lastTimestamp || (hop.timestamp && new Date(hop.timestamp) > new Date(stop.lastTimestamp))) {
+      stop.lastTimestamp = hop.timestamp;
+    }
+  });
+  return Array.from(stops.values()).sort((a, b) => a.firstIndex - b.firstIndex);
+}
+
+function buildFallbackTrajectorySegments(hops = []) {
+  const segments = [];
+  let previous = null;
+  hops.forEach(hop => {
+    const point = observationPoint(hop);
+    if (!point) return;
+    if (!previous) {
+      previous = hop;
+      return;
+    }
+    const previousPoint = observationPoint(previous);
+    const sameCamera = previous.camera_id && hop.camera_id && previous.camera_id === hop.camera_id;
+    if (sameCamera || pointSame(previousPoint, point)) return;
+    segments.push({
+      source_event_id: previous.event_id,
+      destination_event_id: hop.event_id,
+      start_event_id: previous.event_id,
+      end_event_id: hop.event_id,
+      source_camera_id: previous.camera_id,
+      destination_camera_id: hop.camera_id,
+      source_observation: previous,
+      destination_observation: hop,
+      routing_source: "straight_line",
+      distance_source: "straight_line",
+      speed_status: "unavailable",
+    });
+    previous = hop;
+  });
+  return segments;
+}
+
+function stopForSegmentEndpoint(segment, kind, stopsByEvent, stopsByCamera) {
+  const observation = kind === "source"
+    ? (segment.source_observation || segment.start_observation)
+    : (segment.destination_observation || segment.end_observation);
+  const observationPointValue = observationPoint(observation);
+  if (observationPointValue) {
+    return {
+      camera_id: observation.camera_id,
+      camera_label: observation.camera_label || observation.label || observation.camera_id,
+      point: observationPointValue,
+    };
+  }
+  const eventId = kind === "source"
+    ? (segment.source_event_id ?? segment.start_event_id)
+    : (segment.destination_event_id ?? segment.end_event_id);
+  if (eventId != null && stopsByEvent.has(eventId)) return stopsByEvent.get(eventId);
+  const cameraId = kind === "source"
+    ? (segment.source_camera_id ?? segment.start_camera_id)
+    : (segment.destination_camera_id ?? segment.end_camera_id);
+  if (cameraId && stopsByCamera.has(cameraId)) return stopsByCamera.get(cameraId);
+  return null;
+}
+
+function routeSegmentStyle(source, fallbackKind) {
+  if (source === "osrm") return { color: "#57a6ff", dashArray: null, label: routingSourceLabel(source) };
+  if (source === "manual" || source === "configured" || source === "osm") {
+    return {
+      color: "#d9a441",
+      dashArray: "10 8",
+      label: fallbackKind === "geometry"
+        ? routingSourceLabel(source)
+        : "Configured/manual road graph (route geometry unavailable)",
+    };
+  }
+  return {
+    color: "#8b93a0",
+    dashArray: "4 8",
+    label: "Straight-line fallback (no configured road geometry)",
+  };
+}
+
+function renderMap(hops, trajectoryHops = []) {
   initLeafletMap();
   if (!leafletMap || !cameraLayer || !routeLayer) return;
   cameraLayer.clearLayers();
   routeLayer.clearLayers();
 
   const bounds = [];
-  cameras.forEach(camera => {
+  const trajectoryStops = buildTrajectoryStops(hops || []);
+  const relevantCameraIds = new Set(trajectoryStops.map(stop => stop.camera_id).filter(Boolean));
+  const camerasToShow = relevantCameraIds.size
+    ? cameras.filter(camera => relevantCameraIds.has(camera.camera_id))
+    : cameras;
+
+  camerasToShow.forEach(camera => {
     if (camera.lat == null || camera.lng == null) return;
     const heat = trafficHeatmap.find(item => item.camera_id === camera.camera_id);
     const count = heat?.traffic_count || 0;
@@ -428,26 +655,106 @@ function renderMap(hops) {
       fillColor: fill,
       fillOpacity: 0.85,
       weight: 2,
-    }).bindPopup(`<strong>${camera.camera_id}</strong><br>${camera.label}<br>Traffic: ${count}<br>Density: ${density}`);
+    }).bindPopup(`<strong>${camera.camera_id}</strong><br>${camera.label}<br>ANPR observations: ${count}<br>Camera-observation density: ${density}`);
     marker.addTo(cameraLayer);
     bounds.push([camera.lat, camera.lng]);
   });
 
-  const routePoints = (hops || [])
-    .filter(hop => hop.lat != null && hop.lng != null)
-    .map(hop => [hop.lat, hop.lng]);
-  if (routePoints.length) {
+  const stopsByEvent = new Map();
+  const stopsByCamera = new Map();
+  trajectoryStops.forEach(stop => {
+    const point = [stop.lat, stop.lng];
+    if (!stopsByCamera.has(stop.camera_id)) {
+      stopsByCamera.set(stop.camera_id, { ...stop, point });
+    }
+    stop.observations.forEach(observation => {
+      if (observation.event_id != null) stopsByEvent.set(observation.event_id, { ...stop, point });
+    });
+  });
+
+  let osrmRouteSegments = 0;
+  let configuredRouteSegments = 0;
+  let straightLineFallbackSegments = 0;
+  const segmentsToRender = Array.isArray(trajectoryHops) && trajectoryHops.length
+    ? trajectoryHops
+    : buildFallbackTrajectorySegments(hops || []);
+
+  segmentsToRender.forEach(segment => {
+    const sourceStop = stopForSegmentEndpoint(segment, "source", stopsByEvent, stopsByCamera);
+    const destinationStop = stopForSegmentEndpoint(segment, "destination", stopsByEvent, stopsByCamera);
+    let source = segment.routing_source || segment.road_connection?.routing_source || segment.distance_source;
+    const geometry = normalizeRouteGeometry(segment.route_geometry || segment.road_connection?.route_geometry);
+    let routePoints = geometry;
+    let fallbackKind = "geometry";
+
+    if (routePoints.length < 2 && sourceStop?.point && destinationStop?.point && !pointSame(sourceStop.point, destinationStop.point)) {
+      routePoints = [sourceStop.point, destinationStop.point];
+      const hasConfiguredConnection = Boolean(segment.connection_id || segment.road_connection || segment.road_transition);
+      source = hasConfiguredConnection ? (source || "manual") : "straight_line";
+      fallbackKind = hasConfiguredConnection ? "configured" : "straight_line";
+    }
+    if (routePoints.length < 2) return;
+
+    if (source === "osrm" && geometry.length >= 2) osrmRouteSegments += 1;
+    else if (source === "manual" || source === "configured" || source === "osm" || segment.connection_id || segment.road_connection) configuredRouteSegments += 1;
+    else straightLineFallbackSegments += 1;
+
+    const style = routeSegmentStyle(source, fallbackKind);
+    const distance = segment.distance_meters != null
+      ? `${(Number(segment.distance_meters) / 1000).toFixed(2)} km`
+      : segment.road_distance_meters != null
+        ? `${(Number(segment.road_distance_meters) / 1000).toFixed(2)} km`
+        : "distance unavailable";
+    const speed = segment.estimated_speed_kmh != null ? `${Number(segment.estimated_speed_kmh).toFixed(1)} km/h` : "speed unavailable";
+    const time = segment.travel_time_seconds != null ? `${Number(segment.travel_time_seconds).toFixed(0)} sec` : "travel time unavailable";
     L.polyline(routePoints, {
-      color: "#37d67a",
-      weight: 4,
+      color: style.color,
+      weight: source === "osrm" ? 5 : 4,
+      opacity: 0.88,
+      dashArray: style.dashArray,
+    }).bindPopup([
+      `<strong>${style.label}</strong>`,
+      `${segment.source_camera_id || sourceStop?.camera_id || "Camera"} → ${segment.destination_camera_id || destinationStop?.camera_id || "Camera"}`,
+      distance,
+      time,
+      speed,
+    ].join("<br>")).addTo(routeLayer);
+    routePoints.forEach(point => bounds.push(point));
+  });
+
+  trajectoryStops.forEach((stop, index) => {
+    const count = stop.observations.length;
+    const popup = [
+      `<strong>${index + 1}. ${stop.camera_id}</strong>`,
+      stop.camera_label,
+      `${count} observation${count === 1 ? "" : "s"} at this camera`,
+      `First: ${formatTimestamp(stop.firstTimestamp)}`,
+      `Last: ${formatTimestamp(stop.lastTimestamp)}`,
+      selectedPlate ? `Plate: ${selectedPlate}` : "",
+    ].filter(Boolean).join("<br>");
+    L.circleMarker([stop.lat, stop.lng], {
+      radius: Math.min(15, 9 + Math.sqrt(count) * 2),
+      color: "#f8fafc",
+      fillColor: "#37d67a",
+      fillOpacity: 0.95,
+      weight: 3,
+    }).bindPopup(popup).bindTooltip(`${index + 1}. ${stop.camera_id}`, {
+      direction: "top",
       opacity: 0.9,
     }).addTo(routeLayer);
-    hops.filter(hop => hop.lat != null && hop.lng != null).forEach((hop, index) => {
-      const popup = `<strong>${index + 1}. ${hop.camera_id}</strong><br>${hop.camera_label}<br>${new Date(hop.timestamp).toLocaleString()}<br>${hop.matched_plate_text || selectedPlate || ""}`;
-      L.marker([hop.lat, hop.lng]).bindPopup(popup).addTo(routeLayer);
-      bounds.push([hop.lat, hop.lng]);
-    });
-  }
+    bounds.push([stop.lat, stop.lng]);
+  });
+
+  window.__ANPR_LAST_MAP_RENDER = {
+    rawObservationCount: (hops || []).length,
+    displayedCameraMarkerCount: camerasToShow.length,
+    trajectoryStopCount: trajectoryStops.length,
+    transitionSegmentCount: segmentsToRender.length,
+    osrmRouteSegments,
+    configuredRouteSegments,
+    straightLineFallbackSegments,
+    routeLayerCount: routeLayer.getLayers().length,
+  };
 
   if (bounds.length) leafletMap.fitBounds(bounds, { padding: [28, 28], maxZoom: 15 });
 }
@@ -479,7 +786,7 @@ function renderLawEnforcementMap(items) {
         fillColor: "#d9a441",
         fillOpacity: 0.85,
         weight: 2,
-      }).bindPopup(`<strong>Recommended PCR</strong><br>${pcr.pcr_id}<br>${item.distance_km ?? "n/a"} km<br>${item.pcr_location_status}`).addTo(enforcementLayer);
+      }).bindPopup(`<strong>Demo PCR GPS</strong><br>${pcr.pcr_id}<br>${item.distance_km ?? "n/a"} km straight-line<br>${item.pcr_location_status}<br>No real dispatch integration`).addTo(enforcementLayer);
       bounds.push([pcr.latitude, pcr.longitude]);
     }
     if (hasCamera && hasPcr) {
@@ -532,16 +839,20 @@ async function loadTrafficAnalytics() {
   const flows = (data.flow || []).slice(0, 4);
   const od = (data.od_matrix || []).slice(0, 4);
   const congested = (data.congestion || []).filter(item => item.average_estimated_speed_kmh != null).slice(0, 4);
+  const laneLabel = summary.lane_analysis_available
+    ? (summary.lane_analysis_label || "Configured")
+    : "Lane data not configured";
   const summaryLines = [
-    summary.average_road_speed_kmh != null ? `Average road speed: ${Number(summary.average_road_speed_kmh).toFixed(1)} km/h` : "",
-    summary.lane_analysis_available && summary.lane_analysis_label ? `Lane analysis: ${summary.lane_analysis_label}` : "",
+    summary.average_road_speed_kmh != null ? `Estimated average road speed: ${Number(summary.average_road_speed_kmh).toFixed(1)} km/h` : "",
+    `Lane analysis: ${laneLabel}`,
   ].filter(Boolean).join(" · ");
   box.innerHTML = `
     <div class="review-item" style="grid-template-columns:1fr">
-      <div class="review-body">
-        <div class="plate">${summary.total_observations || 0} observations · ${summary.unique_vehicle_count || 0} unique vehicles</div>
-        <div class="meta">Busiest camera: ${busiestCamera ? `${busiestCamera.camera_id} (${busiestCamera.observation_count})` : "none"}</div>
-        <div class="meta">Busiest road: ${busiestRoad ? `${busiestRoad.source_camera_id} → ${busiestRoad.destination_camera_id} (${busiestRoad.movement_count})` : "none"}</div>
+        <div class="review-body">
+          <div class="plate">${summary.total_observations || 0} observations · ${summary.unique_vehicle_count || 0} unique vehicles</div>
+        <div class="meta"><span class="badge info">ANPR-DERIVED</span> Camera-observation density and estimated congestion, not exact physical density.</div>
+        <div class="meta">Busiest camera: ${busiestCamera ? `${busiestCamera.camera_id} (${busiestCamera.observation_count} observations)` : "none"}</div>
+        <div class="meta">Busiest road: ${busiestRoad ? `${busiestRoad.source_camera_id} → ${busiestRoad.destination_camera_id} (${busiestRoad.movement_count} movements)` : "none"}</div>
         ${summaryLines ? `<div class="meta">${summaryLines}</div>` : ""}
       </div>
     </div>
@@ -559,10 +870,10 @@ async function loadTrafficAnalytics() {
     </div>
     <div class="review-item" style="grid-template-columns:1fr">
       <div class="review-body">
-        <div class="plate">Congestion</div>
+        <div class="plate">Estimated congestion</div>
         ${congested.length ? congested.map(item => `
-          <div class="meta"><span class="badge ${trafficBadge(item.congestion_status)}">${item.congestion_status}</span> ${item.source_camera_id} → ${item.destination_camera_id}: ${Number(item.average_estimated_speed_kmh).toFixed(1)} km/h · ${item.movement_count} movement(s)</div>
-        `).join("") : `<div class="meta">No road-speed data yet.</div>`}
+          <div class="meta"><span class="badge ${trafficBadge(item.congestion_status)}">${item.congestion_status}</span> ${item.source_camera_id} → ${item.destination_camera_id}: ${Number(item.average_estimated_speed_kmh).toFixed(1)} km/h estimated avg · ${item.movement_count} movement(s)</div>
+        `).join("") : `<div class="meta">No camera-to-camera speed data yet.</div>`}
       </div>
     </div>
   `;
@@ -579,7 +890,8 @@ async function loadEdgeScalability() {
   box.innerHTML = `
     <div class="review-item" style="grid-template-columns:1fr">
       <div class="review-body">
-        <div class="plate">${data.online_cameras || 0}/${data.registered_cameras || 0} cameras online</div>
+        <div class="plate">${data.online_cameras || 0}/${data.registered_cameras || 0} configured cameras online</div>
+        <div class="meta"><span class="badge info">500+ CAMERA SIMULATION</span> Architecture/demo simulation; not 500 physical live feeds.</div>
         <div class="meta">${data.degraded_cameras || 0} degraded · ${data.offline_cameras || 0} offline · ${data.edge_devices || 0} edge device(s)</div>
         <div class="meta">Queue ${data.queue?.mode || "local"} · backlog ${data.queue?.depth || 0} · workers ${data.queue?.worker_count || 1}</div>
       </div>
@@ -593,7 +905,7 @@ async function loadEdgeScalability() {
     </div>
     <div class="review-item" style="grid-template-columns:1fr">
       <div class="review-body">
-        <div class="plate">${simulation.active ? "Simulation Mode Active" : "Simulation Mode"}</div>
+        <div class="plate">${simulation.active ? "500+ Camera Simulation Active" : "500+ Camera Simulation"}</div>
         <div class="meta">SIMULATION / DEMO · ${simulation.metrics?.camera_count || 0} configured camera(s) · ${simulation.metrics?.generated || 0} generated observation(s)</div>
         <div class="meta">Sampling every ${data.sampling?.sampling_interval || 1} frame(s) · effective ${Number(data.sampling?.effective_processing_fps || 0).toFixed(1)} FPS</div>
       </div>
@@ -624,7 +936,7 @@ async function loadSmartSignals() {
   const movementRows = movements.map(item => `
     <div class="meta">
       <span class="badge ${item.demand_score >= 0.7 ? "bad" : item.demand_score >= 0.4 ? "warn" : "ok"}">${item.movement}</span>
-      demand ${Number(item.demand_score || 0).toFixed(2)} · ${item.observation_count || 0} obs · congestion ${Number(item.congestion_score || 0).toFixed(2)}
+      demand ${Number(item.demand_score || 0).toFixed(2)} · ${item.observation_count || 0} ANPR obs · estimated congestion ${Number(item.congestion_score || 0).toFixed(2)}
     </div>
   `).join("") || `<div class="meta">Insufficient traffic observations for movement scoring.</div>`;
   const recommended = latestSignalRecommendation?.recommendation || {};
@@ -637,7 +949,7 @@ async function loadSmartSignals() {
       <div class="review-body">
         <div class="plate">${junction.name}</div>
         <div class="meta">SIMULATION MODE - NO REAL TRAFFIC SIGNAL CONTROL</div>
-        <div class="meta">${junction.camera_ids.length || 0} camera(s) · controller ${junction.controller.mode} · ${junction.active ? "active" : "inactive"}</div>
+        <div class="meta"><span class="badge info">SIMULATION MODE</span> ${junction.camera_ids.length || 0} camera(s) · controller ${junction.controller.mode} · ${junction.active ? "active" : "inactive"}</div>
       </div>
     </div>
     <div class="review-item" style="grid-template-columns:1fr">
@@ -704,8 +1016,8 @@ async function loadLawEnforcementIncidents() {
         <div class="review-body" style="grid-column:1 / -1">
           <div class="plate">${item.plate_text} · ${item.category || "hotlist"}</div>
           <div class="meta">${item.camera_label || item.camera_id} · ${new Date(item.detected_at).toLocaleString()} · ${item.global_vehicle_id || "No Global Vehicle ID"}</div>
-          <div class="meta">Recommended PCR: ${pcrLabel}</div>
-          <div class="meta">Distance-based recommendation only. ${pcr.demo_only ? "Simulated PCR location." : ""}</div>
+          <div class="meta">Nearest PCR recommendation: ${pcrLabel}</div>
+          <div class="meta"><span class="badge info">DEMO PCR GPS</span> Distance-based recommendation only. ${pcr.demo_only ? "Simulated patrol vehicle location." : "Configured patrol location."} No dispatch or interception is confirmed.</div>
           <div class="incident-actions">
             <span class="badge ${statusBadge(item.status)}">${item.status.replaceAll("_", " ")}</span>
             ${item.status !== "ACKNOWLEDGED" ? `<button type="button" data-status="ACKNOWLEDGED">Acknowledge incident</button>` : ""}
@@ -743,13 +1055,23 @@ function formatDuration(seconds) {
   return minutes ? `${minutes}m ${remaining}s` : `${remaining}s`;
 }
 
+function routingSourceLabel(source) {
+  const value = String(source || "").toLowerCase();
+  if (value === "osrm") return "OSRM road routing (local service)";
+  if (value === "configured" || value === "manual") return "configured/manual road graph";
+  if (value === "straight_line") return "approximate straight-line fallback";
+  return source ? String(source).replaceAll("_", " ") : "";
+}
+
 function speedLine(item) {
   if (!item || item.speed_status === "unavailable") return "";
   if (item.speed_available) {
     const distance = item.road_distance_meters ?? item.distance_meters;
     const distanceText = distance != null ? `${(Number(distance) / 1000).toFixed(2)} km` : "Distance unavailable";
     const approx = item.distance_is_approximate ? " approx." : "";
-    return `<div class="time">${distanceText}${approx} · ${formatDuration(item.travel_time_seconds)} · ${Number(item.estimated_speed_kmh).toFixed(1)} km/h estimated</div>`;
+    const source = item.routing_source || item.distance_source || item.road_connection?.routing_source;
+    const sourceText = source ? ` · ${routingSourceLabel(source)}` : "";
+    return `<div class="time">${distanceText}${approx} · ${formatDuration(item.travel_time_seconds)} · ${Number(item.estimated_speed_kmh).toFixed(1)} km/h estimated${sourceText}</div>`;
   }
   const reason = (item.speed_status || "unavailable").replaceAll("_", " ");
   return `<div class="time">Speed: Not available · ${reason}</div>`;
@@ -1046,7 +1368,7 @@ async function selectVehicle(plate, vehicleId) {
   });
   try {
     const data = await fetchJSON(trajectoryUrl(plate));
-    renderMap(data.hops);
+    renderMap(data.hops, data.trajectory_hops || data.segments || []);
     if (selectedVehicleId) {
       try {
         const history = await fetchJSON(`/api/vehicles/${encodeURIComponent(selectedVehicleId)}/history`);
@@ -1082,8 +1404,9 @@ async function loadStats() {
   document.getElementById("statReview").textContent = s.needs_review;
   try {
     const security = await fetchJSON("/api/security/status");
-    document.getElementById("statSecurity").textContent = security.encryption_at_rest === "CONFIGURED" ? "HARD" : "DEV";
-    document.getElementById("statSecurity").title = `Auth ${security.authentication}; RBAC ${security.rbac}; Audit ${security.audit_chain}; TLS ${security.https_tls}`;
+    const enabled = security.authentication === "ENABLED" && security.rbac === "ENABLED" && security.audit_chain === "ENABLED";
+    document.getElementById("statSecurity").textContent = enabled ? "ON" : "DEV";
+    document.getElementById("statSecurity").title = `Security controls enabled: Auth ${security.authentication}; RBAC ${security.rbac}; Audit ${security.audit_chain}; AES-256-GCM ${security.encryption_at_rest}; TLS deployment config ${security.https_tls}. Local dashboard may still be HTTP.`;
   } catch {
     document.getElementById("statSecurity").textContent = "WARN";
   }
@@ -1507,6 +1830,7 @@ async function refresh() {
   }
   renderCameraSelector();
   try { await loadStats(); } catch (error) {}
+  try { loadMapConfig(); } catch (error) {}
   try { await loadRoadNetwork(); } catch (error) {}
   try { await loadTrafficAnalytics(); } catch (error) {}
   try { await loadEdgeScalability(); } catch (error) {}
@@ -1521,7 +1845,7 @@ async function refresh() {
   if (selectedPlate) {
     try {
       const data = await fetchJSON(trajectoryUrl(selectedPlate));
-      renderMap(data.hops);
+      renderMap(data.hops, data.trajectory_hops || data.segments || []);
       if (selectedVehicleId) {
         try {
           const history = await fetchJSON(`/api/vehicles/${encodeURIComponent(selectedVehicleId)}/history`);
@@ -1594,7 +1918,8 @@ document.getElementById("resetSearch").addEventListener("click", () => {
   document.getElementById("searchEnd").value = "";
   document.getElementById("searchMinutes").disabled = false;
   document.getElementById("searchResults").textContent = "";
-  refresh();
+  if (selectedPlate) selectVehicle(selectedPlate, selectedVehicleId);
+  else refresh();
 });
 window.addEventListener("pagehide", () => { eventSocket?.close(); cameraSocket?.close(); clearInterval(snapshotTimer); });
 window.addEventListener("pageshow", event => {
